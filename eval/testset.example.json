@@ -1,0 +1,19 @@
+[
+  {
+    "url": "https://www.instagram.com/reel/REPLACE_ME/",
+    "folder": "hackathons",
+    "fields": {
+      "title": "CodeFest",
+      "deadline": "2026-11-30",
+      "prize": "50,000",
+      "link": "unstop.com"
+    }
+  },
+  {
+    "url": "https://www.instagram.com/reel/REPLACE_ME_TOO/",
+    "folder": "youtube",
+    "fields": {
+      "tools": "ElevenLabs"
+    }
+  }
+]

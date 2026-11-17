@@ -1,0 +1,14 @@
+# secrets
+.env*
+!.env.example
+
+# python
+.venv/
+__pycache__/
+.pytest_cache/
+
+# data: database, kept screenshots, eval cache
+backend/data/
+eval/cache/
+*.db
+*.db-journal

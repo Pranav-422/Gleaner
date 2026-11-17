@@ -1,0 +1,78 @@
+/* Gleaner: paper and ink, with a wheat accent. Every colour is a token, defined for light and dark. */
+:root {
+  --bg: #f6f1e7;
+  --surface: #fffdf8;
+  --ink: #1d1a15;
+  --muted: #6a6256;
+  --line: #e2d9c8;
+  --accent: #9a5a14;
+  --accent-ink: #fffdf8;
+  --accent-soft: #f2e4cb;
+  --good: #2c6a3d;
+  --warn: #ad3b18;
+  --youtube: #b93a0b;
+  --hackathons: #6546c0;
+  --opportunities: #0c6f68;
+  --tools: #2053c4;
+  --shadow: 0 1px 2px rgb(60 45 20 / 6%), 0 8px 24px rgb(60 45 20 / 6%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12110e;
+    --surface: #1c1a16;
+    --ink: #f2ede3;
+    --muted: #a69d8d;
+    --line: #322d25;
+    --accent: #e3b05a;
+    --accent-ink: #1a1408;
+    --accent-soft: #2c2415;
+    --good: #7fc793;
+    --warn: #f08a66;
+    --youtube: #fb923c;
+    --hackathons: #ab99f2;
+    --opportunities: #4fd1c5;
+    --tools: #7ea9ff;
+    --shadow: none;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+}
+
+html {
+  height: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100%;
+  color: var(--ink);
+  background: var(--bg);
+  font-family: var(--font-body), system-ui, sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+a {
+  color: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
