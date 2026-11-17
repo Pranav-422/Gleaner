@@ -26,7 +26,25 @@ Instagram ─Share→ Gleaner app (phone, hosted on Vercel) ─ waits on the pho
             Google Calendar "Gleaner" + Google Tasks "Gleaner"
 ```
 
-Folders in v1: YouTube, Hackathons, Opportunities, Tools & Bots.
+## What it does (v2)
+
+- **Inputs:** Instagram reels and photo carousels from the Share menu or a pasted link; screenshots (when a
+  reel will not load, or for posters); voice notes (a clear task becomes a to-do, the rest goes to Your Notes).
+  The Claude app can also queue links and save entries (see "Claude connector").
+- **14 folders:** YouTube, Hackathons, Opportunities, Tools & Bots, Quick Picks, Learn (with subtopics),
+  News & Events, Make Money, Project Ideas, Career & Interviews, Free Courses, Repos & Sites, Finance,
+  Your Notes. Each item is stored once; when it genuinely fits a second folder it shows there as a shortcut.
+- **Worth-it score (0-100):** goals 35, payoff 25, credibility 20, low effort 10, freshness 10. Gemini rates
+  the four parts low/medium/high; the arithmetic is in `pipeline.worth`, so every score can be explained.
+  Folders and the Inbox are sorted by it.
+- **Checks (hourly, in the background):** dead-link check on links found in reels, and hackathons,
+  opportunities and news are checked against the official page the reel names (Verified / Differs /
+  Unverified). An official deadline replaces the reel's. News counts as confirmed only from a fixed list
+  of trusted sources. With `GEMINI_SEARCH=1` (needs billing) it can also search Google.
+- **Anti-hoarding:** one next step per entry with Approve/Skip, "Due this week", weekly review event,
+  auto-archive (untouched 30 days, expired, or low score after 7 days; Restore keeps an entry).
+- **Ask AI** on every entry: Explain simply / Give an example / Why it matters, or your own question.
+  The chat is kept per entry.
 
 ## Setup (once)
 
@@ -75,6 +93,28 @@ Gleaner then appears in Instagram's Share menu. The pill shows "Laptop online" w
 Gleaner asks only for `calendar.app.created` (its own calendars, nothing else) and `tasks`. The
 refresh token is stored in Windows Credential Manager, not in a file.
 
+## Claude connector (optional)
+
+Lets the Claude app read your library and save new things. Tools: `list_entries`, `get_entry`,
+`list_pending` (read), `save_link`, `save_entry` (write). It cannot approve, delete, archive or touch Google;
+everything it saves waits in your Inbox and is checked by the laptop like any other input.
+
+1. Install the Supabase CLI once: `npm install -g supabase` (or use `npx supabase`), then `supabase login`.
+2. Make a long random secret: `uv run python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+3. From the repo root:
+   ```
+   supabase link --project-ref <your-project-ref>
+   supabase secrets set MCP_TOKEN=<secret> GLEANER_EMAIL=<your email> GLEANER_PASSWORD=<your password>
+   supabase functions deploy mcp --no-verify-jwt
+   ```
+   `--no-verify-jwt` because Claude sends no Supabase login; the secret in the URL is the key, and the
+   function signs in as you, so row level security still applies.
+4. Claude → Settings → Connectors → Add custom connector → URL
+   `https://<project-ref>.supabase.co/functions/v1/mcp/<secret>`.
+
+Anyone with that URL can read your library and add to your Inbox: keep it private, and change `MCP_TOKEN`
+(step 3) if it ever leaks. Tests: `node --test supabase/functions/mcp/handler.test.ts`.
+
 ## Measuring accuracy
 
 ```
@@ -112,7 +152,19 @@ uv run python -m pytest -q
 - Data lives in `backend/data/` (database, a few kept screenshots, 7 daily backups). Videos are
   deleted right after processing.
 
-## Not in v1
+- Links from reels are fetched only by the background checker, only over http(s) on standard ports, and
+  only when every address the host resolves to is public (no localhost, LAN or cloud metadata), checked
+  again at every redirect. In the app they stay plain text.
+- Screenshots and voice notes are uploaded to a private bucket, copied to the laptop, then deleted from
+  Supabase; the laptop deletes its copy once the item is filed.
 
-Worth-it score, cross-folder shortcuts, web search enrichment, news verification, the other folders,
-voice notes, Ask AI panel, weekly digest beyond the calendar review slot, Claude MCP (v2).
+## Measured so far
+
+- 11 real posts: 9 read end to end (reels and photo carousels), 1 needs an Instagram login, 1 hit
+  "Gemini busy" (now retried automatically). About 1,540 Gemini tokens and 10-16 s per reel.
+- Folder and field accuracy: run `eval/run.py` once the test set has your answers.
+
+## Not built
+
+Notch overlay (needs a native Android app), passkey login, encrypted Drive backup, local Whisper fallback,
+Watchlist folder, always-on VM.

@@ -8,6 +8,7 @@ The laptop signs in as the owner, so row level security applies to it as well: n
 import hashlib
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 
@@ -16,6 +17,9 @@ import httpx2
 from . import db
 
 URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+# Files the phone uploads: <owner id>/<uuid>.<ext>. Anything else is refused before it is downloaded.
+UPLOAD_NAME = re.compile(r"[0-9a-f-]{36}\.(jpg|jpeg|png|webp|webm|ogg|m4a|mp4|mp3)")
+MAX_UPLOAD = 20 * 1024 * 1024
 ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 HEARTBEAT = 60  # seconds between state pushes when nothing changed; the phone calls the laptop offline after 150
 
@@ -59,12 +63,17 @@ class Cloud:
             "GET", "/rest/v1/actions", params={"status": "eq.pending", "order": "created_at", "select": "id,kind,payload"}
         ).json()
         for action in actions:
-            error = apply(action["kind"], action["id"], action["payload"])
+            payload, paths = action["payload"], []
+            if action["kind"] in ("screenshot", "voice"):
+                paths, payload = self._take_uploads(payload)
+            error = apply(action["kind"], action["id"], payload)
             where = {"id": f"eq.{action['id']}"}
             if error is None:
                 self.call("DELETE", "/rest/v1/actions", params=where)
             else:  # left in the table so the phone can show why
                 self.call("PATCH", "/rest/v1/actions", params=where, json={"status": "failed", "error": error[:300]})
+            if paths:  # the laptop has its copy (or refused it); nothing stays in the cloud
+                self.call("DELETE", "/storage/v1/object/uploads", json={"prefixes": paths})
 
         state = snapshot()
         self._upload_frames(state["entries"])
@@ -78,6 +87,26 @@ class Cloud:
                 json={"owner": self.owner, **state, "digest": digest, "seen_at": db.now()},
             )
             self.digest, self.pushed = digest, time.monotonic()
+
+    def _take_uploads(self, payload) -> tuple[list[str], dict]:
+        """Download the phone's uploads into DATA_DIR/uploads. Returns their cloud paths and the payload to apply."""
+        paths = payload.get("paths") if isinstance(payload, dict) else None
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 5:
+            return [], {"files": None}
+        names = []
+        for path in paths:
+            owner, _, name = str(path).partition("/")
+            if owner != self.owner or not UPLOAD_NAME.fullmatch(name):
+                return [], {"files": None}
+            names.append(name)
+        folder = db.DATA_DIR / "uploads"
+        folder.mkdir(parents=True, exist_ok=True)
+        for path, name in zip(paths, names):
+            body = self.call("GET", f"/storage/v1/object/authenticated/uploads/{path}").content
+            if len(body) > MAX_UPLOAD:
+                return paths, {"files": None}
+            (folder / name).write_bytes(body)
+        return paths, {"files": names}
 
     def _upload_frames(self, entries: list[dict]) -> None:
         uploaded = set(json.loads(db.get_setting("cloud_frames") or "[]"))

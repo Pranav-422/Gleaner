@@ -48,6 +48,21 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL);
 """
 
+# Columns added after v1. Added to an existing database on first open; new databases get them the same way.
+COLUMNS = {
+    "jobs": {
+        "source": "TEXT NOT NULL DEFAULT 'link'",  # link | screenshot | voice
+        "files": "TEXT NOT NULL DEFAULT '[]'",  # JSON list of file names in DATA_DIR/uploads
+    },
+    "entries": {
+        "also": "TEXT",  # a second folder the entry shows in as a shortcut
+        "ratings": "TEXT NOT NULL DEFAULT '{}'",  # JSON: relevance, credibility, payoff, effort
+        "checks": "TEXT NOT NULL DEFAULT '{}'",  # JSON: link check and verification results
+        "chat": "TEXT NOT NULL DEFAULT '[]'",  # JSON: Ask AI turns for this entry
+        "archived_at": "TEXT",
+    },
+}
+
 _ready: set[Path] = set()
 
 
@@ -58,6 +73,12 @@ def db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     if path not in _ready:
         conn.executescript(SCHEMA)
+        for table, columns in COLUMNS.items():
+            have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns.items():
+                if name not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+        conn.commit()
         _ready.add(path)
     return conn
 

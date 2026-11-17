@@ -9,6 +9,7 @@ import tempfile
 import time
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -100,13 +101,19 @@ def photo(url: str, out: Path) -> Path | None:
         return None
     raw = out.with_suffix(".img")
     raw.write_bytes(res.content)
-    # Re-encoded by FFmpeg: same size limit as video frames, and WebP becomes JPEG.
+    try:
+        return to_jpeg(raw, out)
+    finally:
+        raw.unlink()
+
+
+def to_jpeg(image: Path, out: Path) -> Path | None:
+    """Re-encode with FFmpeg: same size limit as video frames, and PNG/WebP become a JPEG the OCR reads."""
     done = subprocess.run(
-        ["ffmpeg", "-v", "error", "-y", "-i", str(raw), "-vf", "scale=960:960:force_original_aspect_ratio=decrease",
+        ["ffmpeg", "-v", "error", "-y", "-i", str(image), "-vf", "scale=960:960:force_original_aspect_ratio=decrease",
          "-q:v", "3", str(out)],
         capture_output=True, timeout=60,
     )  # fmt: skip
-    raw.unlink()
     return out if done.returncode == 0 and out.exists() else None
 
 
@@ -243,7 +250,20 @@ def extract(url: str, workdir: Path) -> Extracted:
     return read_videos(videos, caption, duration, workdir, photos)
 
 
-def run_job(job_id: str, url: str, hint: str | None, entry_id: int | None) -> None:
+def extract_upload(source: str, files: list[str], workdir: Path) -> Extracted:
+    """Screenshots go straight to OCR; a voice note goes straight to speech-to-text."""
+    paths = [db.DATA_DIR / "uploads" / name for name in files]
+    if source == "voice":
+        track = audio(paths[0], workdir)
+        transcript = llm.transcribe(track) if track else ""
+        return Extracted(f"VOICE NOTE:\n{transcript.strip()[:4000]}" if transcript.strip() else "", [])
+    photos = [jpeg for index, path in enumerate(paths) if (jpeg := to_jpeg(path, workdir / f"shot_{index:02d}.jpg"))]
+    return read_videos([], "", 0, workdir, photos)
+
+
+def run_job(
+    job_id: str, url: str, hint: str | None, entry_id: int | None, source: str = "link", files: list[str] = ()
+) -> None:
     """Process one job end to end and store the result. The video never outlives this call."""
     frames_dir = db.DATA_DIR / "frames"
     # The extracted text is saved until the job is stored, so a retry after "Gemini busy" (or any later
@@ -254,7 +274,7 @@ def run_job(job_id: str, url: str, hint: str | None, entry_id: int | None) -> No
         text, kept = saved["text"], saved["frames"]
     else:
         with tempfile.TemporaryDirectory(prefix="gleaner-") as tmp:
-            extracted = extract(url, Path(tmp))
+            extracted = extract(url, Path(tmp)) if source == "link" else extract_upload(source, list(files), Path(tmp))
             frames_dir.mkdir(parents=True, exist_ok=True)
             kept = []
             for index, frame in enumerate(extracted.frames):
@@ -269,9 +289,12 @@ def run_job(job_id: str, url: str, hint: str | None, entry_id: int | None) -> No
         result, tokens = None, {"in": 0, "out": 0}
     else:
         weak = len(text) < WEAK_TEXT_CHARS
-        result, tokens = llm.classify(text, hint, [frames_dir / name for name in kept[:2]] if weak else [])
+        images = [frames_dir / name for name in kept[:2]] if weak else []
+        result, tokens = llm.classify(text, hint, images, voice=source == "voice")
     store(job_id, url, entry_id, text, kept, result, tokens)
     cache.unlink()
+    for name in files:  # uploads are read once; the text and kept frames are what remains
+        (db.DATA_DIR / "uploads" / name).unlink(missing_ok=True)
 
 
 def store(job_id, url, entry_id, raw_text, frames_kept, result: llm.Extraction | None, tokens) -> None:
@@ -284,11 +307,16 @@ def store(job_id, url, entry_id, raw_text, frames_kept, result: llm.Extraction |
         folder, review, guesses = result.folder, None, []
 
     fields = result.model_dump(mode="json") if result else {}
+    also = fields.get("also_fits")
+    ratings = {name: fields[name] for name in RATINGS if name in fields}
     row = {
         "url": url,
         "folder": folder,
         "review": review,
         "guesses": json.dumps(guesses),
+        # A shortcut only for a filed entry, and only into a different folder.
+        "also": also if folder and also not in (None, "none", folder) else None,
+        "ratings": json.dumps(ratings),
         "title": fields.pop("title", None) or "Could not read this reel",
         "summary": fields.pop("summary", None),
         "next_step": fields.pop("next_step", None),
@@ -315,6 +343,27 @@ def store(job_id, url, entry_id, raw_text, frames_kept, result: llm.Extraction |
 
 
 ALL_FIELDS = {field for names in llm.FOLDER_FIELDS.values() for field in names}
+RATINGS = ("relevance", "credibility", "payoff", "effort")
+_LEVEL = {"low": 0.0, "medium": 0.5, "high": 1.0}
+
+
+def worth(ratings: dict, deadline: str | None, created_at: str, today: date) -> int:
+    """Worth-it score, 0-100: goals 35, payoff 25, credibility 20, low effort 10, freshness 10.
+
+    Plain arithmetic on the model's four ratings, so a score can always be explained. Freshness is full while a
+    deadline is ahead and zero once it passed; without a deadline it fades over 60 days.
+    """
+    level = {name: _LEVEL.get(ratings.get(name, "medium"), 0.5) for name in RATINGS}
+    if deadline:
+        fresh = 1.0 if deadline >= today.isoformat() else 0.0
+    else:
+        age = (today - date.fromisoformat(created_at[:10])).days
+        fresh = max(0.0, 1 - age / 60)
+    total = (
+        35 * level["relevance"] + 25 * level["payoff"] + 20 * level["credibility"]
+        + 10 * (1 - level["effort"]) + 10 * fresh
+    )  # fmt: skip
+    return round(total)
 
 
 def _merge_duplicate(conn, folder: str, row: dict) -> int | None:

@@ -10,6 +10,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 from contextlib import asynccontextmanager, closing
 from datetime import date, timedelta
 from typing import Literal
@@ -20,9 +21,10 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
-from . import auth, db, google, llm, pipeline, relay
+from . import auth, checks, db, google, llm, pipeline, relay
 
 WEB_OUT = db.ROOT / "web" / "out"
+UPKEEP_EVERY = 3600  # seconds
 
 # Windows takes MIME types from the registry, which can map .js to text/plain and break the app.
 mimetypes.add_type("text/javascript", ".js")
@@ -33,20 +35,30 @@ async def worker() -> None:
     """One job at a time, oldest first. A single worker is also what keeps free-tier usage gentle."""
     with closing(db.db()) as conn, conn:  # jobs cut off by a restart go back in the queue
         conn.execute("UPDATE jobs SET status = 'pending' WHERE status = 'processing'")
+    last_upkeep = 0.0
     while True:
         with closing(db.db()) as conn, conn:
             job = conn.execute(
-                "SELECT id, url, hint, entry_id FROM jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1"
+                "SELECT id, url, hint, entry_id, source, files FROM jobs WHERE status = 'pending'"
+                " ORDER BY created_at LIMIT 1"
             ).fetchone()
             if job:
                 conn.execute("UPDATE jobs SET status = 'processing' WHERE id = ?", (job["id"],))
         if not job:
             await asyncio.to_thread(db.backup)  # does nothing if today's copy exists
+            if time.monotonic() - last_upkeep > UPKEEP_EVERY:  # link checks, verification, auto-archive
+                last_upkeep = time.monotonic()
+                try:
+                    await asyncio.to_thread(checks.upkeep)
+                except Exception as exc:  # upkeep is best effort; the queue must keep running
+                    logging.getLogger("gleaner").warning("upkeep: %s", exc)
             await asyncio.sleep(3)
             continue
         status, error, pause = "done", None, 0
         try:
-            await asyncio.to_thread(pipeline.run_job, job["id"], job["url"], job["hint"], job["entry_id"])
+            await asyncio.to_thread(
+                pipeline.run_job, job["id"], job["url"], job["hint"], job["entry_id"], job["source"], json.loads(job["files"])
+            )
         except llm.RateLimited as exc:
             status, error, pause = "pending", str(exc), 60
         except Exception as exc:  # any failure is recorded on the job; the owner can re-run it
@@ -160,7 +172,7 @@ def share(body: Share):
 def jobs():
     with closing(db.db()) as conn:
         rows = conn.execute(
-            "SELECT j.id, j.url, j.status, j.error, j.created_at, j.tokens_in, j.tokens_out,"
+            "SELECT j.id, j.url, j.source, j.status, j.error, j.created_at, j.tokens_in, j.tokens_out,"
             " e.folder, e.review, e.title FROM jobs j LEFT JOIN entries e ON e.id = j.entry_id"
             " ORDER BY j.created_at DESC LIMIT 100"
         ).fetchall()
@@ -183,9 +195,11 @@ def retry(job_id: UUID):
 
 def _entry(row) -> dict:
     entry = dict(row)
-    for column in ("guesses", "data", "frames"):
+    for column in ("guesses", "data", "frames", "ratings", "checks", "chat"):
         entry[column] = json.loads(entry[column])
-    entry["expired"] = bool(entry["deadline"]) and entry["deadline"] < date.today().isoformat()
+    today = date.today()
+    entry["expired"] = bool(entry["deadline"]) and entry["deadline"] < today.isoformat()
+    entry["score"] = pipeline.worth(entry["ratings"], entry["deadline"], entry["created_at"], today)
     return entry
 
 
@@ -329,6 +343,14 @@ def apply_action(kind: str, action_id: str, payload) -> str | None:
             if not google.configured():
                 return "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are not set in backend/.env"
             google.auth_url()
+        elif kind in ("screenshot", "voice"):  # relay.py has already moved the files into DATA_DIR/uploads
+            add_upload(action_id, kind, payload["files"])
+        elif kind == "ask":
+            ask_entry(int(payload["entry_id"]), payload["question"])
+        elif kind in ("archive", "restore"):
+            archive_entry(int(payload["entry_id"]), kind == "archive")
+        elif kind == "save_entry":  # from the Claude connector (supabase/functions/mcp)
+            save_entry(action_id, payload)
         elif kind == "google_code":  # Google sent the phone back with this; only the laptop can redeem it
             code, state = payload["code"], payload["state"]
             if not (isinstance(code, str) and isinstance(state, str) and len(code) < 1000 and len(state) < 100):
@@ -338,11 +360,81 @@ def apply_action(kind: str, action_id: str, payload) -> str | None:
             return f"Unknown action: {kind}"
     except HTTPException as exc:
         return str(exc.detail)
+    except llm.RateLimited:
+        return "Gemini is busy. Try again in a minute."
     except (PermissionError, RuntimeError) as exc:  # Google refused, or the sign-in link expired
         return str(exc)
-    except (ValidationError, KeyError, TypeError, ValueError) as exc:  # payloads come from outside: check, never trust
+    except (ValidationError, KeyError, TypeError, ValueError, AttributeError) as exc:  # payloads come from outside
         return f"Bad request ({type(exc).__name__})"
     return None
+
+
+UPLOAD_NAME = relay.UPLOAD_NAME
+
+
+def add_upload(job_id: str, source: str, files) -> None:
+    """A job from screenshots (up to 5, one post) or one voice note, already saved in DATA_DIR/uploads."""
+    folder = db.DATA_DIR / "uploads"
+    if (
+        not isinstance(files, list) or not 1 <= len(files) <= (1 if source == "voice" else 5)
+        or not all(isinstance(name, str) and UPLOAD_NAME.fullmatch(name) and (folder / name).is_file() for name in files)
+    ):  # fmt: skip
+        raise ValueError("bad upload")
+    with closing(db.db()) as conn, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO jobs (id, url, source, files, created_at) VALUES (?, '', ?, ?, ?)",
+            (str(UUID(job_id)), source, json.dumps(files), db.now()),
+        )
+
+
+def ask_entry(entry_id: int, question) -> None:
+    """Ask AI: one question about one entry; the answer is kept in the entry's chat."""
+    if not isinstance(question, str) or not 2 <= len(question.strip()) <= 500:
+        raise ValueError("bad question")
+    with closing(db.db()) as conn:
+        entry = _entry(_get_entry(conn, entry_id))
+    # Summary and fields first, then a slice of the raw text: enough context without spending the quota.
+    fields = "\n".join(f"{name}: {value}" for name, value in entry["data"].items())
+    context = "\n".join(
+        part
+        for part in (entry["title"], entry["summary"], fields, f"Next step: {entry['next_step']}",
+                     (entry["raw_text"] or "")[:1500])
+        if part
+    )  # fmt: skip
+    answer, _ = llm.ask(context, entry["chat"], question.strip())
+    chat = (entry["chat"] + [{"role": "you", "text": question.strip()}, {"role": "ai", "text": answer}])[-20:]
+    with closing(db.db()) as conn, conn:
+        conn.execute("UPDATE entries SET chat = ? WHERE id = ?", (json.dumps(chat), entry_id))
+
+
+def save_entry(action_id: str, payload) -> None:
+    """An entry Claude wrote after reading a reel. Same schema check as Gemini's output; the owner still approves."""
+    url = payload.get("url") or ""
+    if url and pipeline.instagram_url(url) != url:
+        raise ValueError("only Instagram links")
+    result = llm.Extraction.model_validate(
+        {"second_folder": "none", "confidence": 1.0, "readable": True, **payload["entry"]}
+    )
+    if result.folder == "none":
+        raise ValueError("pick a folder")
+    job_id = str(UUID(action_id))
+    with closing(db.db()) as conn, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO jobs (id, url, source, status, created_at) VALUES (?, ?, 'claude', 'processing', ?)",
+            (job_id, url, db.now()),
+        )
+    pipeline.store(job_id, url, None, str(payload.get("notes") or "")[:4000], [], result, {"in": 0, "out": 0})
+
+
+def archive_entry(entry_id: int, archive: bool) -> None:
+    with closing(db.db()) as conn, conn:
+        entry = _get_entry(conn, entry_id)
+        # A restored entry is marked kept, so auto-archive does not take it straight back.
+        marks = {**json.loads(entry["checks"]), "kept": not archive}
+        conn.execute(
+            "UPDATE entries SET archived_at = ?, checks = ? WHERE id = ?",
+            (db.now() if archive else None, json.dumps(marks), entry_id),
+        )
 
 
 def snapshot() -> dict:

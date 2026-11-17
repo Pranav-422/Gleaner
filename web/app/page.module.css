@@ -41,9 +41,10 @@
 
 .sectionHead {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
-  gap: 1rem;
+  gap: 0.25rem 1rem;
 }
 
 .sectionHead h2 {
@@ -410,6 +411,7 @@
   list-style: none;
   display: flex;
   flex-wrap: wrap;
+  align-items: flex-start;
   gap: 0.3rem;
 }
 
@@ -643,3 +645,94 @@
   color: var(--accent-ink);
   align-self: flex-start;
 }
+
+/* ---------- v2: score, checks, shortcuts, Ask AI, adding by screenshot or voice ---------- */
+
+.flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.flag {
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  color: var(--muted);
+  background: var(--bg);
+}
+
+.flag[data-tone="good"] {
+  color: var(--good);
+  background: color-mix(in srgb, var(--good) 12%, transparent);
+}
+
+.flag[data-tone="warn"] {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+
+.score {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--c);
+}
+
+.note {
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.bubble {
+  font-size: 0.92rem;
+  line-height: 1.45;
+  padding: 0.5rem 0.7rem;
+  border-radius: 0.8rem;
+  background: var(--bg);
+  white-space: pre-wrap;
+  max-width: 92%;
+}
+
+.bubble[data-role="you"] {
+  align-self: flex-end;
+  background: var(--accent-soft);
+}
+
+.small {
+  font-size: 0.85rem;
+  padding: 0.3rem 0.7rem;
+}
+
+.group {
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-top: 0.4rem;
+}
+
+.recording {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.card[data-folder="news"] { --c: var(--warn); }
+.card[data-folder="quick_picks"],
+.card[data-folder="repos"] { --c: var(--tools); }
+.card[data-folder="learn"],
+.card[data-folder="courses"],
+.card[data-folder="career"] { --c: var(--opportunities); }
+.card[data-folder="make_money"],
+.card[data-folder="finance"] { --c: var(--good); }
+.card[data-folder="project_ideas"] { --c: var(--hackathons); }
+.card[data-folder="notes"] { --c: var(--accent); }

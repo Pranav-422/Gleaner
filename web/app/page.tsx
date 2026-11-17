@@ -9,6 +9,7 @@ type Queued = { id: string; text: string };
 type Job = {
   id: string;
   url: string;
+  source: "link" | "screenshot" | "voice" | "claude";
   status: "pending" | "processing" | "done" | "failed";
   error: string | null;
   created_at: string;
@@ -35,7 +36,14 @@ type Action = {
 // up: laptop seen lately. down: laptop off, showing what it last sent. nonet: this phone cannot reach Supabase.
 // login: not signed in. setup: the app was built without its Supabase settings.
 type Conn = "checking" | "up" | "down" | "nonet" | "login" | "setup";
-type Tab = "inbox" | Folder | "history" | "settings";
+type Tab = "inbox" | Folder | "archive" | "history" | "settings";
+type Upload = { blob: Blob; type: string };
+
+const CORE: Folder[] = ["youtube", "hackathons", "opportunities", "tools"]; // always shown; the rest once they have entries
+const IMAGE_TYPES: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
+const AUDIO_TYPES: Record<string, string> = { "audio/webm": "webm", "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/mpeg": "mp3" };
+const MAX_RECORDING = 5 * 60_000;
+const byScore = (a: Entry, b: Entry) => b.score - a.score;
 
 const KEY = "gleaner-queue";
 const OFFLINE_AFTER = 150_000; // ms. The laptop pushes its state at least once a minute while it runs.
@@ -87,6 +95,12 @@ export default function Home() {
   const [draft, setDraft] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [recording, setRecording] = useState(false);
+  const recorder = useRef<MediaRecorder | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const owner = useRef("");
+  const fast = useRef(false); // poll every 3 s while an answer or an action is on its way
+  const lastSync = useRef(0);
   const busy = useRef(false);
   const signed = useRef<Record<string, string>>({});
   const digest = useRef("");
@@ -97,7 +111,7 @@ export default function Home() {
     if (!cloud) return "setup";
     const { data } = await cloud.auth.getSession();
     if (!data.session) return "login";
-    const owner = data.session.user.id;
+    owner.current = data.session.user.id;
 
     for (const item of readQueue()) {
       const { error } = await cloud
@@ -116,6 +130,7 @@ export default function Home() {
     const head = headRes.data;
     setSeenAt(head?.seen_at ?? null);
     setActions(actionsRes.data ?? []);
+    fast.current = (actionsRes.data ?? []).some((action) => action.status === "pending");
     let list = entriesNow.current;
     if (head && head.digest !== digest.current) {
       const full = await cloud.from("state").select("jobs, entries, status").maybeSingle();
@@ -131,7 +146,7 @@ export default function Home() {
     // Screenshots sit in a private bucket: ask for links that work for a week, once per screenshot.
     const missing = list.flatMap((entry) => entry.frames).filter((name) => !signed.current[name]);
     if (missing.length) {
-      const res = await cloud.storage.from("frames").createSignedUrls(missing.map((name) => `${owner}/${name}`), 7 * 86400);
+      const res = await cloud.storage.from("frames").createSignedUrls(missing.map((name) => `${owner.current}/${name}`), 7 * 86400);
       for (const item of res.data ?? []) {
         if (item.signedUrl && item.path) signed.current[item.path.split("/").pop()!] = item.signedUrl;
       }
@@ -143,6 +158,7 @@ export default function Home() {
   async function sync() {
     if (busy.current) return;
     busy.current = true;
+    lastSync.current = Date.now();
     try {
       setQueue(readQueue());
       connNow.current = await load().catch((): Conn => "nonet");
@@ -172,6 +188,52 @@ export default function Home() {
     await sync();
   }
 
+  // Screenshots and voice notes go to the private uploads bucket; the action tells the laptop where they are.
+  async function sendFiles(kind: "screenshot" | "voice", files: Upload[], types: Record<string, string>) {
+    if (!cloud || !owner.current) return setNotice("Sign in first.");
+    const paths: string[] = [];
+    for (const file of files) {
+      const type = file.type.split(";")[0];
+      if (!types[type]) return setNotice(`This file type is not supported (${type || "unknown"}).`);
+      if (file.blob.size > 20 * 1024 * 1024) return setNotice("That file is over 20 MB.");
+      const path = `${owner.current}/${crypto.randomUUID()}.${types[type]}`;
+      const { error } = await cloud.storage.from("uploads").upload(path, file.blob, { contentType: type });
+      if (error) return setNotice(`Upload failed: ${error.message}`);
+      paths.push(path);
+    }
+    await act(kind, { paths });
+  }
+
+  function pickScreenshots(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = [...(event.target.files ?? [])].slice(0, 5);
+    event.target.value = "";
+    if (files.length) sendFiles("screenshot", files.map((file) => ({ blob: file, type: file.type })), IMAGE_TYPES);
+  }
+
+  async function toggleRecording() {
+    if (recorder.current) return recorder.current.stop();
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      return setNotice("Microphone access was refused.");
+    }
+    const media = new MediaRecorder(stream);
+    const chunks: Blob[] = [];
+    media.ondataavailable = (event) => chunks.push(event.data);
+    media.onstop = () => {
+      stream.getTracks().forEach((track) => track.stop());
+      recorder.current = null;
+      setRecording(false);
+      const type = media.mimeType || "audio/webm";
+      sendFiles("voice", [{ blob: new Blob(chunks, { type }), type }], AUDIO_TYPES);
+    };
+    media.start();
+    recorder.current = media;
+    setRecording(true);
+    setTimeout(() => media.state === "recording" && media.stop(), MAX_RECORDING);
+  }
+
   useEffect(() => {
     if (process.env.NODE_ENV === "production") navigator.serviceWorker?.register("/sw.js");
 
@@ -199,8 +261,9 @@ export default function Home() {
     document.addEventListener("visibilitychange", onVisible);
     // Keep the screen fresh so finished jobs and the laptop's comings and goings show by themselves.
     const timer = setInterval(() => {
-      if (document.visibilityState === "visible") sync();
-    }, 10_000);
+      const wait = fast.current && connNow.current === "up" ? 3_000 : 10_000;
+      if (document.visibilityState === "visible" && Date.now() - lastSync.current >= wait) sync();
+    }, 1_000);
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
       clearInterval(timer);
@@ -238,28 +301,65 @@ export default function Home() {
   }
 
   const signedIn = conn === "up" || conn === "down" || conn === "nonet";
-  const waitingFor = new Set(
-    actions.filter((action) => action.status === "pending" && "entry_id" in action.payload).map((action) => Number(action.payload.entry_id)),
-  );
+  const pendingFor = (ask: boolean) =>
+    new Set(
+      actions
+        .filter((action) => action.status === "pending" && "entry_id" in action.payload && (action.kind === "ask") === ask)
+        .map((action) => Number(action.payload.entry_id)),
+    );
+  const waitingFor = pendingFor(false);
+  const askingFor = pendingFor(true);
   const sentShares = actions.filter((action) => action.kind === "share" && action.status === "pending");
+  const sentFiles = actions.filter((action) => (action.kind === "screenshot" || action.kind === "voice") && action.status === "pending");
   const failedActions = actions.filter((action) => action.status === "failed");
-  const card = (entry: Entry) => (
-    <EntryCard key={entry.id} entry={entry} act={act} waiting={waitingFor.has(entry.id)} frameUrl={(name) => frames[name]} />
+  const card = (entry: Entry, shortcut = false) => (
+    <EntryCard
+      key={`${entry.id}${shortcut ? "s" : ""}`}
+      entry={entry}
+      act={act}
+      waiting={waitingFor.has(entry.id)}
+      asking={askingFor.has(entry.id)}
+      frameUrl={(name) => frames[name]}
+      shortcut={shortcut}
+    />
   );
 
-  const review = entries.filter((entry) => entry.review);
-  const undecided = entries.filter((entry) => !entry.review && !entry.decision && !entry.expired);
+  const live = entries.filter((entry) => !entry.archived_at);
+  const archived = entries.filter((entry) => entry.archived_at);
+  const review = live.filter((entry) => entry.review);
+  // The worth-it score decides the order: gold rises, junk sinks (and is archived first).
+  const undecided = live.filter((entry) => !entry.review && !entry.decision && !entry.expired).sort(byScore);
   const inbox = [...review, ...undecided];
+  const week = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10);
+  const dueSoon = live
+    .filter((entry) => entry.decision === "approved" && entry.deadline && !entry.expired && entry.deadline <= week)
+    .sort((a, b) => a.deadline!.localeCompare(b.deadline!));
   const working = jobs.filter((job) => job.status === "pending" || job.status === "processing").length;
   const failed = jobs.filter((job) => job.status === "failed").length;
   const done = jobs.filter((job) => job.status === "done").length;
-  const inFolder = (folder: Folder) => entries.filter((entry) => entry.folder === folder);
+  const inFolder = (folder: Folder) => live.filter((entry) => entry.folder === folder).sort(byScore);
+  const shortcuts = (folder: Folder) => live.filter((entry) => entry.also === folder && entry.folder !== folder).sort(byScore);
+  const folderTabs = (Object.keys(FOLDERS) as Folder[]).filter(
+    (folder) => CORE.includes(folder) || inFolder(folder).length + shortcuts(folder).length > 0 || tab === folder,
+  );
   const tabs: [Tab, string, number][] = [
     ["inbox", "Inbox", inbox.length],
-    ...(Object.entries(FOLDERS) as [Folder, string][]).map(([name, label]): [Tab, string, number] => [name, label, 0]),
+    ...folderTabs.map((name): [Tab, string, number] => [name, FOLDERS[name], 0]),
+    ...(archived.length ? ([["archive", "Archive", 0]] as [Tab, string, number][]) : []),
     ["history", "History", failed],
     ["settings", "Settings", 0],
   ];
+  const sourceLabel = { link: "Reel", screenshot: "Screenshot", voice: "Voice note", claude: "Saved by Claude" };
+  // Learn is split into its subfolders (Productivity, Communication, ...).
+  const groups = (folder: Folder, list: Entry[]): [string, Entry[]][] => {
+    if (folder !== "learn") return [["", list]];
+    const named = new Map<string, Entry[]>();
+    for (const entry of list) {
+      const topic = typeof entry.data.subtopic === "string" ? entry.data.subtopic : "Other";
+      named.set(topic, [...(named.get(topic) ?? []), entry]);
+    }
+    return [...named.entries()];
+  };
   const pill = {
     checking: "Connecting",
     up: working ? `Reading ${working} reel${working > 1 ? "s" : ""}` : "Laptop online",
@@ -342,11 +442,11 @@ export default function Home() {
         </form>
       )}
 
-      {queue.length + sentShares.length > 0 && (
+      {queue.length + sentShares.length + sentFiles.length > 0 && (
         <section>
           <div className={styles.sectionHead}>
             <h2>Waiting for the laptop</h2>
-            <p>{queue.length + sentShares.length} links</p>
+            <p>{queue.length + sentShares.length + sentFiles.length} waiting</p>
           </div>
           <ul className={styles.list}>
             {queue.map((item) => (
@@ -363,6 +463,14 @@ export default function Home() {
                   Sent
                 </span>
                 <span className={styles.meta}>{String(action.payload.text)}</span>
+              </li>
+            ))}
+            {sentFiles.map((action) => (
+              <li key={action.id}>
+                <span className={styles.dot} data-status="processing">
+                  Sent
+                </span>
+                <span className={styles.meta}>{action.kind === "voice" ? "Voice note" : "Screenshots"}</span>
               </li>
             ))}
           </ul>
@@ -414,9 +522,70 @@ export default function Home() {
 
           {tab === "inbox" && (
             <section>
+              <div className={styles.panel}>
+                <span className={styles.label}>Add</span>
+                <form onSubmit={addDraft} className={styles.row}>
+                  <input
+                    aria-label="Reel link"
+                    inputMode="url"
+                    autoComplete="off"
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    placeholder="Paste a reel link…"
+                  />
+                  <button type="submit" className={styles.primary}>
+                    Add
+                  </button>
+                </form>
+                <div className={styles.row}>
+                  <button type="button" className={`${styles.ghost} ${styles.small}`} onClick={() => fileInput.current?.click()}>
+                    Screenshots
+                  </button>
+                  <input
+                    ref={fileInput}
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    multiple
+                    hidden
+                    tabIndex={-1}
+                    onChange={pickScreenshots}
+                  />
+                  <button
+                    type="button"
+                    className={`${recording ? styles.primary : styles.ghost} ${styles.small} ${recording ? styles.recording : ""}`}
+                    onClick={toggleRecording}
+                    aria-pressed={recording}
+                  >
+                    {recording ? "● Stop and send" : "Voice note"}
+                  </button>
+                </div>
+                <p className={styles.muted}>
+                  Screenshots: when a reel will not load, or for posters. Voice notes: a clear task becomes a to-do.
+                </p>
+              </div>
+
+              {dueSoon.length > 0 && (
+                <>
+                  <div className={styles.sectionHead}>
+                    <h2>Due this week</h2>
+                    <p>Approved, deadline in 7 days</p>
+                  </div>
+                  <ul className={styles.list}>
+                    {dueSoon.map((entry) => (
+                      <li key={entry.id}>
+                        <strong>{entry.title}</strong>
+                        <span className={styles.meta}>
+                          {entry.next_step} · {entry.deadline}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+
               <div className={styles.sectionHead}>
                 <h2>Needs you</h2>
-                {inbox.length > 0 && <p>Approve, skip or sort</p>}
+                {inbox.length > 0 && <p>Best first: sorted by worth-it score</p>}
               </div>
               {inbox.length === 0 ? (
                 <div className={styles.empty}>
@@ -424,7 +593,7 @@ export default function Home() {
                   Share a reel from Instagram and it lands here.
                 </div>
               ) : (
-                inbox.map(card)
+                inbox.map((entry) => card(entry))
               )}
             </section>
           )}
@@ -435,14 +604,33 @@ export default function Home() {
                 <h2>{FOLDERS[tab as Folder]}</h2>
                 <p>{inFolder(tab as Folder).length} saved</p>
               </div>
-              {inFolder(tab as Folder).length === 0 ? (
+              {inFolder(tab as Folder).length + shortcuts(tab as Folder).length === 0 ? (
                 <div className={styles.empty}>
                   <strong>Nothing here yet</strong>
                   Reels that fit this folder appear here.
                 </div>
               ) : (
-                inFolder(tab as Folder).map(card)
+                <>
+                  {groups(tab as Folder, inFolder(tab as Folder)).map(([name, list]) => (
+                    <div key={name} className={styles.list}>
+                      {name && <h3 className={styles.group}>{name}</h3>}
+                      {list.map((entry) => card(entry))}
+                    </div>
+                  ))}
+                  {shortcuts(tab as Folder).length > 0 && <h3 className={styles.group}>Also fits here</h3>}
+                  {shortcuts(tab as Folder).map((entry) => card(entry, true))}
+                </>
               )}
+            </section>
+          )}
+
+          {tab === "archive" && (
+            <section>
+              <div className={styles.sectionHead}>
+                <h2>Archive</h2>
+                <p>Untouched for a month, expired, or low worth-it. Restore keeps it.</p>
+              </div>
+              {archived.map((entry) => card(entry))}
             </section>
           )}
 
@@ -474,9 +662,13 @@ export default function Home() {
                 <ul className={styles.list}>
                   {jobs.map((job) => (
                     <li key={job.id}>
-                      <a href={job.url} target="_blank" rel="noopener noreferrer">
-                        {job.title || new URL(job.url).pathname}
-                      </a>
+                      {job.url ? (
+                        <a href={job.url} target="_blank" rel="noopener noreferrer">
+                          {job.title || new URL(job.url).pathname}
+                        </a>
+                      ) : (
+                        <strong>{job.title || sourceLabel[job.source] || "Upload"}</strong>
+                      )}
                       <span className={styles.dot} data-status={job.status}>
                         {job.status}
                       </span>
@@ -504,25 +696,6 @@ export default function Home() {
               <div className={styles.sectionHead}>
                 <h2>Settings</h2>
               </div>
-
-              <form onSubmit={addDraft} className={styles.panel}>
-                <label className={styles.label} htmlFor="link">
-                  Add a reel by link
-                </label>
-                <div className={styles.row}>
-                  <input
-                    id="link"
-                    inputMode="url"
-                    autoComplete="off"
-                    value={draft}
-                    onChange={(event) => setDraft(event.target.value)}
-                    placeholder="https://www.instagram.com/reel/…"
-                  />
-                  <button type="submit" className={styles.primary}>
-                    Add
-                  </button>
-                </div>
-              </form>
 
               {status && (
                 <ul className={styles.list}>

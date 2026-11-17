@@ -45,12 +45,15 @@ create policy "owner only" on public.state for all to authenticated
 revoke all on public.actions, public.state from anon;
 grant select, insert, update, delete on public.actions, public.state to authenticated;
 
--- frames: screenshots the laptop keeps from reels. uploads: screenshots the phone sends in (images, 10 MB max).
+-- frames: screenshots the laptop keeps from reels.
+-- uploads: screenshots and voice notes the phone sends in (20 MB max); the laptop deletes each after reading it.
 insert into storage.buckets (id, name, public) values ('frames', 'frames', false)
   on conflict (id) do nothing;
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
-  values ('uploads', 'uploads', false, 10485760, array['image/jpeg', 'image/png', 'image/webp'])
-  on conflict (id) do nothing;
+  values ('uploads', 'uploads', false, 20971520,
+          array['image/jpeg', 'image/png', 'image/webp', 'audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg'])
+  on conflict (id) do update set file_size_limit = excluded.file_size_limit,
+                                 allowed_mime_types = excluded.allowed_mime_types;
 
 drop policy if exists "gleaner frames owner" on storage.objects;
 create policy "gleaner frames owner" on storage.objects for all to authenticated

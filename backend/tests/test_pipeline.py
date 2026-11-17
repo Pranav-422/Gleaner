@@ -195,7 +195,7 @@ def test_gemini_retry_does_not_download_again(client, monkeypatch):
     pulls, calls = [], []
     monkeypatch.setattr(pipeline, "extract", lambda url, tmp: pulls.append(url) or pipeline.Extracted("x" * 300, []))
 
-    def classify(text, hint, images):
+    def classify(text, hint, images, voice=False):
         calls.append(text)
         if len(calls) == 1:
             raise llm.RateLimited("busy")
