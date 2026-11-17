@@ -272,6 +272,27 @@ export default function Home() {
     };
   }, []);
 
+  // Tabs are browser history entries, so the phone's own Back button steps back through them.
+  const depth = useRef(0);
+  function go(next: Tab) {
+    if (next === tab) return;
+    history.pushState({ tab: next }, "");
+    depth.current += 1;
+    setTab(next);
+  }
+  function back() {
+    if (depth.current > 0) history.back();
+    else setTab("inbox"); // opened straight on a tab: going back must not leave the app
+  }
+  useEffect(() => {
+    const onPop = (event: PopStateEvent) => {
+      depth.current = Math.max(0, depth.current - 1);
+      setTab((event.state?.tab as Tab | undefined) ?? "inbox");
+    };
+    addEventListener("popstate", onPop);
+    return () => removeEventListener("popstate", onPop);
+  }, []);
+
   useEffect(() => {
     // Opening the emailed reset link signs in for recovery only; ask for the new password then.
     const listener = cloud?.auth.onAuthStateChange((event) => {
@@ -571,13 +592,21 @@ export default function Home() {
                 key={name}
                 type="button"
                 aria-current={tab === name ? "page" : undefined}
-                onClick={() => setTab(name)}
+                onClick={() => go(name)}
               >
                 {label}
                 {count > 0 && <span className={styles.count}>{count}</span>}
               </button>
             ))}
           </nav>
+
+          {tab !== "inbox" && (
+            <div className={styles.row}>
+              <button type="button" className={`${styles.ghost} ${styles.small}`} onClick={back}>
+                ← Back
+              </button>
+            </div>
+          )}
 
           {tab === "inbox" && (
             <section>
