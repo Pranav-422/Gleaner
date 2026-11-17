@@ -96,6 +96,8 @@ export default function Home() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [recording, setRecording] = useState(false);
+  const [recovering, setRecovering] = useState(false);
+  const [newPassword, setNewPasswordValue] = useState("");
   const recorder = useRef<MediaRecorder | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const owner = useRef("");
@@ -271,6 +273,14 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    // Opening the emailed reset link signs in for recovery only; ask for the new password then.
+    const listener = cloud?.auth.onAuthStateChange((event) => {
+      if (event === "PASSWORD_RECOVERY") setRecovering(true);
+    });
+    return () => listener?.data.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 6000);
     return () => clearTimeout(timer);
@@ -290,6 +300,26 @@ export default function Home() {
     const { error } = await cloud.auth.signInWithPassword({ email: email.trim(), password });
     setPassword("");
     setNotice(error ? error.message : "");
+    sync();
+  }
+
+  // Forgot password: Supabase emails a link back to this app, which then asks for a new password.
+  async function forgot() {
+    if (!cloud) return;
+    if (!email.trim()) return setNotice("Type your email first, then tap Forgot password.");
+    await cloud.auth.resetPasswordForEmail(email.trim(), { redirectTo: `${location.origin}/` });
+    // Same message either way, so the page does not reveal which emails have an account.
+    setNotice("If that email has an account, a reset link is on its way.");
+  }
+
+  async function setNewPassword(event: React.FormEvent) {
+    event.preventDefault();
+    if (!cloud) return;
+    const { error } = await cloud.auth.updateUser({ password: newPassword });
+    setNewPasswordValue("");
+    if (error) return setNotice(error.message);
+    setRecovering(false);
+    setNotice("Password changed. Also update SUPABASE_PASSWORD in backend/.env on the laptop.");
     sync();
   }
 
@@ -407,13 +437,39 @@ export default function Home() {
         </p>
       )}
 
-      {conn === "login" && (
+      {recovering && (
+        <form onSubmit={setNewPassword} className={styles.panel}>
+          <label className={styles.label} htmlFor="new-password">
+            Choose a new password
+          </label>
+          <div className={styles.row}>
+            <input
+              id="new-password"
+              type="password"
+              autoComplete="new-password"
+              minLength={10}
+              required
+              value={newPassword}
+              onChange={(event) => setNewPasswordValue(event.target.value)}
+            />
+            <button type="submit" className={styles.primary}>
+              Save
+            </button>
+          </div>
+          <p className={styles.muted}>At least 10 characters.</p>
+        </form>
+      )}
+
+      {conn === "login" && !recovering && (
         <form onSubmit={login} className={styles.panel}>
           <div>
             <label className={styles.label} htmlFor="email">
               Sign in
             </label>
-            <p className={styles.muted}>Shared links stay on this phone until you sign in.</p>
+            <p className={styles.muted}>
+              Gleaner has one owner account, so there is no sign-up. Use the email and password you added in
+              Supabase (Authentication, Users). Shared links stay on this phone until you sign in.
+            </p>
           </div>
           <input
             id="email"
@@ -439,6 +495,9 @@ export default function Home() {
               Unlock
             </button>
           </div>
+          <button type="button" className={`${styles.ghost} ${styles.small}`} onClick={forgot}>
+            Forgot password?
+          </button>
         </form>
       )}
 
