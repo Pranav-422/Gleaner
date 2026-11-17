@@ -86,6 +86,7 @@
 }
 
 .pill[data-conn="down"]::before,
+.pill[data-conn="nonet"]::before,
 .pill[data-conn="setup"]::before {
   background: var(--warn);
 }

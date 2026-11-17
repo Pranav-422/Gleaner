@@ -21,7 +21,8 @@ import keyring
 from . import db
 
 SCOPES = "https://www.googleapis.com/auth/calendar.app.created https://www.googleapis.com/auth/tasks"
-# Must match the redirect URI registered for the OAuth client, so connecting is done on the laptop itself.
+# Must match a redirect URI registered for the OAuth client. Set it to the hosted app's address to connect from
+# the phone (the app passes the code back through Supabase); the default works only in the laptop's browser.
 REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/api/google/callback")
 TIMEZONE = os.environ.get("GLEANER_TZ", "Asia/Kolkata")
 CALENDAR = "https://www.googleapis.com/calendar/v3"
@@ -55,7 +56,15 @@ def auth_url() -> str:
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
-    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(query)
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(query)
+    db.set_setting("google_auth_url", url)
+    return url
+
+
+def pending_url() -> str | None:
+    """The consent link from the last start, while it is unused and under 10 minutes old."""
+    saved = (db.get_setting("google_oauth") or "||0").split("|")
+    return db.get_setting("google_auth_url") if saved[0] and time.time() < float(saved[2]) else None
 
 
 def finish(code: str, state: str) -> None:

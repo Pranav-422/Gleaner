@@ -1,4 +1,5 @@
-// Offline shell. The app is served by the laptop, so it must still open when the laptop is off.
+// Offline shell, so the app still opens (and can queue shares) with no internet. Supabase calls are
+// cross-origin and pass straight through.
 const CACHE = "gleaner-shell-v1";
 const EXTRA = ["/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
 

@@ -4,14 +4,18 @@ Share an Instagram reel from your phone. Gleaner reads it (caption, on-screen te
 into a folder, and gives you one next step. Approve it, and the deadline and task land in a dedicated
 **Gleaner** Google Calendar and task list, so your phone reminds you.
 
-Personal tool: one owner, runs on your laptop, reachable only from your own devices through Tailscale.
+Personal tool: one owner. The work runs on your laptop; phone and laptop meet in a Supabase project,
+so the laptop opens no port and needs no tunnel.
 
 ## How it works
 
 ```
-Instagram ─Share→ Gleaner app (phone) ─ waits on the phone if the laptop is off
-                        │  over Tailscale HTTPS
-                        ▼
+Instagram ─Share→ Gleaner app (phone, hosted on Vercel) ─ waits on the phone if offline
+                        │  writes an "action" row          ▲ reads the "state" row
+                        ▼                                   │
+                 Supabase (Postgres + Auth + private frames bucket, owner-only RLS)
+                        │  laptop polls every 5 s           ▲ pushes jobs, entries, status
+                        ▼                                   │
           Backend on the laptop (FastAPI + SQLite, one background worker)
           yt-dlp → FFmpeg key frames → Windows OCR → Groq Whisper → rule cleanup
                         │  clean text only (+2 frames when text is thin)
@@ -30,14 +34,16 @@ Needs: Python with `uv`, Node.js, FFmpeg on PATH, Windows 10/11 (for the built-i
 
 1. **Keys.** Copy `backend/.env.example` to `backend/.env`. Add your Gemini key and Groq key.
 2. **Password.** In `backend/`, run `uv run python -m app.auth`. Paste the printed line into `.env`.
-3. **Build the app.**
-   ```
-   cd web
-   npm install
-   npm run build
-   ```
-4. **Tailscale.** Install it on the laptop and the phone, same account. In the Tailscale admin
-   console, DNS page: turn on MagicDNS and HTTPS Certificates.
+3. **Supabase** (free, supabase.com):
+   1. New project. Pick a strong database password (you will not need it again).
+   2. SQL Editor → New query → paste `supabase/schema.sql` → Run.
+   3. Authentication → Users → **Add user** → your email and a strong password, "Auto confirm" on.
+   4. Authentication → Sign In / Providers → turn **off** "Allow new users to sign up".
+   5. Project Settings → API: copy the project URL and the **anon** key. Put them, plus the email and
+      password from step 3, into `backend/.env` (`SUPABASE_*`). Never copy the `service_role` key.
+4. **Host the phone app** on Vercel (free): Add New → Project → import this GitHub repo →
+   Root Directory `web` → Environment Variables `NEXT_PUBLIC_SUPABASE_URL` and
+   `NEXT_PUBLIC_SUPABASE_ANON_KEY` (same two values) → Deploy. You get an `https://….vercel.app` address.
 
 ## Run
 
@@ -46,10 +52,8 @@ cd backend
 uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-In a second terminal, once: `tailscale serve --bg 8000`. It prints your `https://<laptop>.<tailnet>.ts.net` address.
-
-On the phone: open that address in Chrome, menu → **Add to Home screen** → **Install**. Gleaner then
-appears in Instagram's Share menu.
+On the phone: open the Vercel address in Chrome, sign in, menu → **Add to Home screen** → **Install**.
+Gleaner then appears in Instagram's Share menu. The pill shows "Laptop online" while the backend runs.
 
 > On this laptop, use `uv run python -m <tool>`, not `uv run <tool>`: Windows Application Control blocks
 > the `.exe` launchers inside the virtual environment.
@@ -59,11 +63,14 @@ appears in Instagram's Share menu.
 1. In Google Cloud Console, create a project. Enable **Google Calendar API** and **Google Tasks API**.
 2. OAuth consent screen: External, add yourself as a test user, then set the publishing status to
    **In production**. In "Testing" status, Google expires the sign-in after 7 days.
-3. Credentials → Create OAuth client ID → **Web application**. Authorized redirect URI:
-   `http://127.0.0.1:8000/api/google/callback`
-4. Put the client ID and secret in `backend/.env`, restart the backend.
-5. **On the laptop**, open `http://127.0.0.1:8000` → Settings → **Connect Google**. You will see an
-   "unverified app" warning; that is expected for a personal app.
+3. Credentials → Create OAuth client ID → **Web application**. Authorized redirect URI: your Vercel
+   address with a trailing slash, e.g. `https://gleaner-xyz.vercel.app/`
+4. In `backend/.env`: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` set to that
+   same address. Restart the backend.
+5. In the app (phone is fine, laptop must be on) → Settings → **Connect Google** → wait a few seconds →
+   **Continue to Google** → allow. You will see an "unverified app" warning; that is expected for a
+   personal app. Google sends you back to the app, which passes the one-time code to the laptop through
+   Supabase. The client secret and refresh token never leave the laptop.
 
 Gleaner asks only for `calendar.app.created` (its own calendars, nothing else) and `tasks`. The
 refresh token is stored in Windows Credential Manager, not in a file.
@@ -88,8 +95,14 @@ uv run python -m pytest -q
 
 ## Security notes
 
-- The backend listens on `127.0.0.1` only. `tailscale serve` is the only way in from other devices.
-- Every API route needs the login cookie (`HttpOnly`, `Secure`, `SameSite=Strict`). 5 wrong passwords
+- The backend listens on `127.0.0.1` only and nothing connects in. It only makes outgoing calls to Supabase.
+- Supabase: row level security ties every row and screenshot to its owner; logged-out visitors get no
+  access; sign-ups are off. The laptop signs in as the owner, so it is bound by the same rules. The anon
+  key in the phone app is public by design.
+- Phone actions are checked by the same code as the local API (Instagram-only links, allowed folders,
+  length limits) before anything runs. Bad ones are marked failed with the reason, never executed.
+- Reel data, entries and a few screenshots are stored in your Supabase project, not only on the laptop.
+- Local API routes need the login cookie (`HttpOnly`, `Secure`, `SameSite=Strict`). 5 wrong passwords
   lock login for 5 minutes.
 - Only `instagram.com` links are accepted, rebuilt without query strings before reaching yt-dlp.
 - Reel text is sent to Gemini as data inside a delimited block; the model has no tools, and its

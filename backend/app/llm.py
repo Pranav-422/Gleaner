@@ -136,6 +136,8 @@ def classify(text: str, hint: str | None = None, images: list[Path] = ()) -> tup
     )
     if res.status_code == 429:
         raise RateLimited("Gemini free-tier limit reached")
+    if res.status_code in (500, 503):  # "high demand" on the free model: try again later, not a failure
+        raise RateLimited(f"Gemini is busy ({res.status_code})")
     if res.status_code != 200:
         raise RuntimeError(f"Gemini error {res.status_code}: {res.text[:300]}")
 

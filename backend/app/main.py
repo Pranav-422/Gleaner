@@ -1,11 +1,12 @@
 """Gleaner backend: HTTP API, login, and the background worker.
 
 Run from backend/:  uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-Listens on localhost only; `tailscale serve` is the only way in from other devices.
+Listens on localhost only. The phone never connects here: it goes through Supabase (see relay.py).
 """
 
 import asyncio
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -17,9 +18,9 @@ from uuid import UUID
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from . import auth, db, google, llm, pipeline
+from . import auth, db, google, llm, pipeline, relay
 
 WEB_OUT = db.ROOT / "web" / "out"
 
@@ -56,11 +57,25 @@ async def worker() -> None:
         await asyncio.sleep(pause)
 
 
+async def relay_loop() -> None:
+    cloud = relay.Cloud()
+    while True:
+        try:
+            await asyncio.to_thread(cloud.sync, apply_action, snapshot)
+        except Exception as exc:  # no internet, Supabase down, wrong password: log and try again
+            logging.getLogger("gleaner").warning("relay: %s", exc)
+            await asyncio.sleep(25)
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    task = asyncio.create_task(worker())
+    tasks = [asyncio.create_task(worker())]
+    if relay.configured():
+        tasks.append(asyncio.create_task(relay_loop()))
     yield
-    task.cancel()
+    for task in tasks:
+        task.cancel()
 
 
 app = FastAPI(title="Gleaner", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -117,6 +132,7 @@ def status():
         "groq_key": bool(os.environ.get("GROQ_API_KEY")),
         "google_configured": google.configured(),
         "google_connected": google.connected(),
+        "google_auth_url": google.pending_url(),
     }
 
 
@@ -289,6 +305,50 @@ def google_callback(code: str = "", state: str = "", error: str = ""):
 def google_disconnect():
     google.disconnect()
     return {"ok": True}
+
+
+# ---------- cloud relay ----------
+
+
+def apply_action(kind: str, action_id: str, payload) -> str | None:
+    """Run one action from the phone through the same handlers as the API. Returns an error message, or None."""
+    try:
+        if kind == "share":
+            share(Share(id=action_id, text=payload["text"]))
+        elif kind == "decision":
+            decide(int(payload["entry_id"]), Decision(decision=payload["decision"]))
+        elif kind == "file":
+            file_entry(int(payload["entry_id"]), FileInto(folder=payload["folder"]))
+        elif kind == "context":
+            add_context(int(payload["entry_id"]), Context(hint=payload["hint"]))
+        elif kind == "retry":
+            retry(UUID(str(payload["job_id"])))
+        elif kind == "google_disconnect":
+            google_disconnect()
+        elif kind == "google_start":  # the consent link reaches the phone through the state row
+            if not google.configured():
+                return "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are not set in backend/.env"
+            google.auth_url()
+        elif kind == "google_code":  # Google sent the phone back with this; only the laptop can redeem it
+            code, state = payload["code"], payload["state"]
+            if not (isinstance(code, str) and isinstance(state, str) and len(code) < 1000 and len(state) < 100):
+                raise ValueError("bad code or state")
+            google.finish(code, state)
+        else:
+            return f"Unknown action: {kind}"
+    except HTTPException as exc:
+        return str(exc.detail)
+    except (PermissionError, RuntimeError) as exc:  # Google refused, or the sign-in link expired
+        return str(exc)
+    except (ValidationError, KeyError, TypeError, ValueError) as exc:  # payloads come from outside: check, never trust
+        return f"Bad request ({type(exc).__name__})"
+    return None
+
+
+def snapshot() -> dict:
+    # raw_text shows only on Needs Context cards; dropping it elsewhere keeps the phone's downloads small.
+    slim = [{**entry, "raw_text": entry["raw_text"] if entry["review"] == "needs_context" else None} for entry in entries()]
+    return {"jobs": jobs(), "entries": slim, "status": status()}
 
 
 # Mounted last so /api routes win. Missing until `npm run build` has run in web/.

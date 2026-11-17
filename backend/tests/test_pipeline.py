@@ -7,7 +7,7 @@ from datetime import date, timedelta
 import pytest
 from pydantic import ValidationError
 
-from app import google, llm, pipeline
+from app import db, google, llm, pipeline
 
 
 def extraction(**changes):
@@ -183,3 +183,28 @@ def test_text_on_screen_is_read_from_a_video(tmp_path, monkeypatch):
         assert expected in result.text
     assert result.text.count("CodeFest Hackathon 2026") == 1  # seen in several frames, kept once
     assert 1 <= len(result.frames) <= pipeline.KEPT_FRAMES
+
+
+def test_photo_only_from_instagram_cdn(tmp_path):
+    for url in ("https://evil.example/a.jpg", "http://scontent.cdninstagram.com/a.jpg", "https://fbcdn.net.evil.example/a.jpg"):
+        assert pipeline.photo(url, tmp_path / "a.jpg") is None
+
+
+def test_gemini_retry_does_not_download_again(client, monkeypatch):
+    from app import llm
+    pulls, calls = [], []
+    monkeypatch.setattr(pipeline, "extract", lambda url, tmp: pulls.append(url) or pipeline.Extracted("x" * 300, []))
+
+    def classify(text, hint, images):
+        calls.append(text)
+        if len(calls) == 1:
+            raise llm.RateLimited("busy")
+        return extraction(), {"in": 1, "out": 1}
+
+    monkeypatch.setattr(llm, "classify", classify)
+    job_id = client.post("/api/share", json={"id": str(uuid.uuid4()), "text": "https://www.instagram.com/reel/r1/"}).json()["id"]
+    with pytest.raises(llm.RateLimited):
+        pipeline.run_job(job_id, "https://www.instagram.com/reel/r1/", None, None)
+    pipeline.run_job(job_id, "https://www.instagram.com/reel/r1/", None, None)
+    assert len(pulls) == 1 and len(calls) == 2
+    assert not list((db.DATA_DIR / "extracted").iterdir())  # cache gone once stored

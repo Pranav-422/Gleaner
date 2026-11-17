@@ -28,7 +28,8 @@ export type Entry = {
   expired: boolean;
 };
 
-export type Act = (path: string, body: object) => Promise<void>;
+// Sends one action to the laptop through Supabase.
+export type Act = (kind: string, payload: object) => Promise<void>;
 
 /** "13 days left · 30 Nov", and how urgent that is. */
 function due(deadline: string): { text: string; tone: "late" | "soon" | "far" } {
@@ -40,9 +41,19 @@ function due(deadline: string): { text: string; tone: "late" | "soon" | "far" } 
   return { text: `${left} · ${when}`, tone: days <= 7 ? "soon" : "far" };
 }
 
-export function EntryCard({ entry, act }: { entry: Entry; act: Act }) {
+export function EntryCard({
+  entry,
+  act,
+  waiting,
+  frameUrl,
+}: {
+  entry: Entry;
+  act: Act;
+  waiting: boolean; // an action for this entry is sent but the laptop has not applied it yet
+  frameUrl: (name: string) => string | undefined;
+}) {
   const [hint, setHint] = useState("");
-  const base = `/api/entries/${entry.id}`;
+  const id = { entry_id: entry.id };
   const others = (Object.keys(FOLDERS) as Folder[]).filter((folder) => !entry.guesses.includes(folder));
   const deadline = entry.deadline ? due(entry.deadline) : null;
   const kind = entry.folder ? FOLDERS[entry.folder] : entry.review === "disputed" ? "Which folder?" : "Could not read";
@@ -85,25 +96,36 @@ export function EntryCard({ entry, act }: { entry: Entry; act: Act }) {
 
       {entry.frames.length > 0 && (
         <div className={styles.thumbs}>
-          {entry.frames.map((name) => (
-            <a key={name} href={`/api/frames/${name}`} target="_blank" rel="noopener noreferrer">
-              <img src={`/api/frames/${name}`} alt="Screenshot from the reel" loading="lazy" />
-            </a>
-          ))}
+          {entry.frames.map((name) => {
+            const src = frameUrl(name);
+            return (
+              src && (
+                <a key={name} href={src} target="_blank" rel="noopener noreferrer">
+                  <img src={src} alt="Screenshot from the reel" loading="lazy" />
+                </a>
+              )
+            );
+          })}
         </div>
       )}
 
-      {entry.review === "disputed" && (
+      {waiting && (
+        <div className={styles.action}>
+          <p className={styles.step}>Sent. The laptop applies it when it is on.</p>
+        </div>
+      )}
+
+      {!waiting && entry.review === "disputed" && (
         <div className={styles.action}>
           <p className={styles.actionLabel}>Pick the folder</p>
           <div className={styles.row}>
             {entry.guesses.map((folder) => (
-              <button key={folder} type="button" className={styles.primary} onClick={() => act(`${base}/file`, { folder })}>
+              <button key={folder} type="button" className={styles.primary} onClick={() => act("file", { ...id, folder })}>
                 {FOLDERS[folder]}
               </button>
             ))}
             {others.map((folder) => (
-              <button key={folder} type="button" className={styles.ghost} onClick={() => act(`${base}/file`, { folder })}>
+              <button key={folder} type="button" className={styles.ghost} onClick={() => act("file", { ...id, folder })}>
                 {FOLDERS[folder]}
               </button>
             ))}
@@ -111,12 +133,12 @@ export function EntryCard({ entry, act }: { entry: Entry; act: Act }) {
         </div>
       )}
 
-      {entry.review === "needs_context" && (
+      {!waiting && entry.review === "needs_context" && (
         <form
           className={styles.action}
           onSubmit={(event) => {
             event.preventDefault();
-            act(`${base}/context`, { hint });
+            act("context", { ...id, hint });
           }}
         >
           <label className={styles.actionLabel} htmlFor={`hint-${entry.id}`}>
@@ -146,15 +168,15 @@ export function EntryCard({ entry, act }: { entry: Entry; act: Act }) {
         </form>
       )}
 
-      {!entry.review && !entry.decision && (
+      {!waiting && !entry.review && !entry.decision && (
         <div className={styles.action}>
           <p className={styles.actionLabel}>Next step</p>
           <p className={styles.step}>{entry.next_step || "Decide what to do with this."}</p>
           <div className={styles.row}>
-            <button type="button" className={styles.primary} onClick={() => act(`${base}/decision`, { decision: "approved" })}>
+            <button type="button" className={styles.primary} onClick={() => act("decision", { ...id, decision: "approved" })}>
               Approve
             </button>
-            <button type="button" className={styles.ghost} onClick={() => act(`${base}/decision`, { decision: "skipped" })}>
+            <button type="button" className={styles.ghost} onClick={() => act("decision", { ...id, decision: "skipped" })}>
               Skip
             </button>
           </div>

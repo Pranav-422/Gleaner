@@ -13,7 +13,10 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(auth, "_failures", 0)
     monkeypatch.setattr(auth, "_locked_until", 0.0)
     monkeypatch.setenv("GLEANER_PASSWORD_HASH", auth.hash_password(PASSWORD))
-    for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"):
+    for name in (
+        "GEMINI_API_KEY", "GROQ_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
+        "SUPABASE_EMAIL", "SUPABASE_PASSWORD",
+    ):  # fmt: skip
         monkeypatch.delenv(name, raising=False)
 
 

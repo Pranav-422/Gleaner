@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { type Entry, EntryCard, FOLDERS, type Folder } from "./entries";
+import { cloud } from "./cloud";
+import { type Act, type Entry, EntryCard, FOLDERS, type Folder } from "./entries";
 import styles from "./page.module.css";
 
 type Queued = { id: string; text: string };
@@ -17,12 +18,27 @@ type Job = {
   review: string | null;
   title: string | null;
 };
-type Status = { gemini_key: boolean; groq_key: boolean; google_configured: boolean; google_connected: boolean };
-// up: laptop answers. down: no answer. login: password needed. setup: no password set on the laptop yet.
-type Conn = "checking" | "up" | "down" | "login" | "setup";
+type Status = {
+  gemini_key: boolean;
+  groq_key: boolean;
+  google_configured: boolean;
+  google_connected: boolean;
+  google_auth_url: string | null; // consent link the laptop made after "Connect Google"; valid 10 minutes
+};
+type Action = {
+  id: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  status: "pending" | "failed";
+  error: string | null;
+};
+// up: laptop seen lately. down: laptop off, showing what it last sent. nonet: this phone cannot reach Supabase.
+// login: not signed in. setup: the app was built without its Supabase settings.
+type Conn = "checking" | "up" | "down" | "nonet" | "login" | "setup";
 type Tab = "inbox" | Folder | "history" | "settings";
 
 const KEY = "gleaner-queue";
+const OFFLINE_AFTER = 150_000; // ms. The laptop pushes its state at least once a minute while it runs.
 
 // shortcut: localStorage holds the waiting list (a few short links); move to IndexedDB if the
 // service worker ever has to send it (Background Sync cannot read localStorage).
@@ -34,20 +50,8 @@ function readQueue(): Queued[] {
   }
 }
 const writeQueue = (queue: Queued[]) => localStorage.setItem(KEY, JSON.stringify(queue));
-// The id is made here so the laptop can ignore a link that gets sent twice.
+// The id is made here so a link that gets sent twice is applied once.
 const enqueue = (text: string) => writeQueue([...readQueue(), { id: crypto.randomUUID(), text }]);
-
-// A switched-off laptop does not refuse the connection, it just never answers: give up after 8 s.
-const api = (path: string, body?: object) =>
-  fetch(path, {
-    method: body ? "POST" : "GET",
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(8000),
-  }).catch(() => null);
-
-const connFrom = (res: Response | null): Conn =>
-  res?.status === 401 ? "login" : res?.status === 503 ? "setup" : "down";
 
 const ago = (iso: string) => {
   const minutes = Math.round((Date.now() - new Date(iso).getTime()) / 60_000);
@@ -73,73 +77,100 @@ export default function Home() {
   const [queue, setQueue] = useState<Queued[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [entries, setEntries] = useState<Entry[]>([]);
+  const [actions, setActions] = useState<Action[]>([]);
   const [status, setStatus] = useState<Status | null>(null);
+  const [seenAt, setSeenAt] = useState<string | null>(null);
+  const [frames, setFrames] = useState<Record<string, string>>({});
   const [conn, setConn] = useState<Conn>("checking");
   const [tab, setTab] = useState<Tab>("inbox");
-  const [rejected, setRejected] = useState<string[]>([]);
   const [notice, setNotice] = useState("");
   const [draft, setDraft] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const busy = useRef(false);
-  const connNow = useRef<Conn>("checking");
+  const signed = useRef<Record<string, string>>({});
+  const digest = useRef("");
+  const entriesNow = useRef<Entry[]>([]);
+  const connNow = useRef<Conn>("checking"); // for code that runs outside a render, like the Google return
+
+  async function load(): Promise<Conn> {
+    if (!cloud) return "setup";
+    const { data } = await cloud.auth.getSession();
+    if (!data.session) return "login";
+    const owner = data.session.user.id;
+
+    for (const item of readQueue()) {
+      const { error } = await cloud
+        .from("actions")
+        .upsert({ id: item.id, kind: "share", payload: { text: item.text } }, { onConflict: "id", ignoreDuplicates: true });
+      if (error) return "nonet"; // kept on the phone; tried again next time
+      writeQueue(readQueue().filter((queued) => queued.id !== item.id));
+    }
+
+    // Polled every few seconds, so only the small columns; the big ones come down when the digest changes.
+    const [headRes, actionsRes] = await Promise.all([
+      cloud.from("state").select("digest, seen_at").maybeSingle(),
+      cloud.from("actions").select("id, kind, payload, status, error").order("created_at"),
+    ]);
+    if (headRes.error || actionsRes.error) return "nonet";
+    const head = headRes.data;
+    setSeenAt(head?.seen_at ?? null);
+    setActions(actionsRes.data ?? []);
+    let list = entriesNow.current;
+    if (head && head.digest !== digest.current) {
+      const full = await cloud.from("state").select("jobs, entries, status").maybeSingle();
+      if (full.error || !full.data) return "nonet";
+      list = full.data.entries;
+      setJobs(full.data.jobs);
+      setEntries(list);
+      setStatus(full.data.status);
+      digest.current = head.digest;
+      entriesNow.current = list;
+    }
+
+    // Screenshots sit in a private bucket: ask for links that work for a week, once per screenshot.
+    const missing = list.flatMap((entry) => entry.frames).filter((name) => !signed.current[name]);
+    if (missing.length) {
+      const res = await cloud.storage.from("frames").createSignedUrls(missing.map((name) => `${owner}/${name}`), 7 * 86400);
+      for (const item of res.data ?? []) {
+        if (item.signedUrl && item.path) signed.current[item.path.split("/").pop()!] = item.signedUrl;
+      }
+      setFrames({ ...signed.current });
+    }
+    return head && Date.now() - new Date(head.seen_at).getTime() < OFFLINE_AFTER ? "up" : "down";
+  }
 
   async function sync() {
     if (busy.current) return;
     busy.current = true;
     try {
       setQueue(readQueue());
-      let state: Conn = "up";
-      for (const item of readQueue()) {
-        const res = await api("/api/share", item);
-        // 422: the laptop read it and found no Instagram link, so drop it.
-        // Anything else that is not a success (offline, login needed, server error): keep it.
-        if (res?.ok || res?.status === 422) {
-          writeQueue(readQueue().filter((queued) => queued.id !== item.id));
-          if (!res.ok) setRejected((list) => [...list, item.text]);
-        } else {
-          state = connFrom(res);
-          break;
-        }
-      }
-      if (state === "up") {
-        const [jobsRes, entriesRes, statusRes] = await Promise.all([
-          api("/api/jobs"),
-          api("/api/entries"),
-          api("/api/status"),
-        ]);
-        if (jobsRes?.ok && entriesRes?.ok && statusRes?.ok) {
-          setJobs(await jobsRes.json());
-          setEntries(await entriesRes.json());
-          setStatus(await statusRes.json());
-        } else {
-          state = connFrom(jobsRes);
-        }
-      }
-      connNow.current = state;
-      setConn(state);
+      connNow.current = await load().catch((): Conn => "nonet");
+      setConn(connNow.current);
       setQueue(readQueue());
     } finally {
       busy.current = false;
     }
   }
 
-  // One place for every button that changes something on the laptop.
-  const act = async (path: string, body: object) => {
-    const res = await api(path, body);
-    if (!res) setNotice("The laptop did not answer. Nothing was changed.");
-    else if (!res.ok) setNotice((await res.json().catch(() => null))?.detail || `That did not work (${res.status}).`);
-    else {
-      const result = await res.json().catch(() => ({}));
-      setNotice(
-        result.decision === "approved"
-          ? result.google
-            ? "Approved. Added to your Gleaner calendar and tasks."
-            : "Approved. Google is not connected, so no reminder was made."
-          : "",
-      );
-    }
+  // Every button that changes something becomes one row in `actions`; the laptop picks it up.
+  const act: Act = async (kind, payload) => {
+    if (!cloud) return;
+    const { error } = await cloud.from("actions").insert({ id: crypto.randomUUID(), kind, payload });
+    setNotice(
+      error
+        ? "Could not reach the internet. Nothing was sent."
+        : connNow.current === "up"
+          ? "Sent. The laptop applies it in a few seconds."
+          : "Saved. The laptop applies it when it is on.",
+    );
     await sync();
   };
+
+  async function dismiss(id: string) {
+    await cloud?.from("actions").delete().eq("id", id);
+    await sync();
+  }
 
   useEffect(() => {
     if (process.env.NODE_ENV === "production") navigator.serviceWorker?.register("/sw.js");
@@ -151,16 +182,25 @@ export default function Home() {
       enqueue(shared);
       history.replaceState(null, "", "/");
     }
-    sync();
+    // Google's consent screen comes back as /?code=...&state=... (or ?error=...). The code is single use and
+    // tied to a secret that never leaves the laptop, so it is handed over as a normal action.
+    const code = params.get("code");
+    const state = params.get("state");
+    if (code || params.get("error")) history.replaceState(null, "", "/");
+    if (params.get("error")) setNotice("Google sign-in was cancelled.");
+    // Sync first, so the notice after sending the code knows whether the laptop is on.
+    sync().then(() => {
+      if (code && state) act("google_code", { code, state });
+    });
 
     const onVisible = () => {
       if (document.visibilityState === "visible") sync();
     };
     document.addEventListener("visibilitychange", onVisible);
-    // While the laptop is answering, keep the screen fresh so finished jobs appear by themselves.
+    // Keep the screen fresh so finished jobs and the laptop's comings and goings show by themselves.
     const timer = setInterval(() => {
-      if (document.visibilityState === "visible" && connNow.current === "up") sync();
-    }, 8000);
+      if (document.visibilityState === "visible") sync();
+    }, 10_000);
     return () => {
       document.removeEventListener("visibilitychange", onVisible);
       clearInterval(timer);
@@ -183,11 +223,29 @@ export default function Home() {
 
   async function login(event: React.FormEvent) {
     event.preventDefault();
-    const res = await api("/api/login", { password });
+    if (!cloud) return;
+    const { error } = await cloud.auth.signInWithPassword({ email: email.trim(), password });
     setPassword("");
-    setNotice(res?.ok ? "" : res ? "Wrong password. After 5 wrong tries, wait 5 minutes." : "The laptop did not answer.");
+    setNotice(error ? error.message : "");
     sync();
   }
+
+  async function logout() {
+    await cloud?.auth.signOut();
+    digest.current = "";
+    entriesNow.current = [];
+    sync();
+  }
+
+  const signedIn = conn === "up" || conn === "down" || conn === "nonet";
+  const waitingFor = new Set(
+    actions.filter((action) => action.status === "pending" && "entry_id" in action.payload).map((action) => Number(action.payload.entry_id)),
+  );
+  const sentShares = actions.filter((action) => action.kind === "share" && action.status === "pending");
+  const failedActions = actions.filter((action) => action.status === "failed");
+  const card = (entry: Entry) => (
+    <EntryCard key={entry.id} entry={entry} act={act} waiting={waitingFor.has(entry.id)} frameUrl={(name) => frames[name]} />
+  );
 
   const review = entries.filter((entry) => entry.review);
   const undecided = entries.filter((entry) => !entry.review && !entry.decision && !entry.expired);
@@ -203,9 +261,10 @@ export default function Home() {
     ["settings", "Settings", 0],
   ];
   const pill = {
-    checking: "Looking for the laptop",
-    up: working ? `Reading ${working} reel${working > 1 ? "s" : ""}` : "Laptop connected",
-    down: "Laptop offline",
+    checking: "Connecting",
+    up: working ? `Reading ${working} reel${working > 1 ? "s" : ""}` : "Laptop online",
+    down: seenAt ? `Laptop offline · ${ago(seenAt)}` : "Laptop not set up",
+    nonet: "No internet",
     login: "Locked",
     setup: "Needs setup",
   }[conn];
@@ -233,30 +292,46 @@ export default function Home() {
 
       {conn === "down" && (
         <p className={styles.banner}>
-          The laptop is off or out of reach. Keep sharing: links wait safely on this phone and go across the next time
-          you open Gleaner with the laptop on.
+          {seenAt
+            ? "The laptop is off. This is what it showed last. Keep sharing and tapping: it all runs when the laptop is back on."
+            : "The laptop has not checked in yet. Start Gleaner on the laptop with the Supabase settings in backend/.env."}
         </p>
+      )}
+      {conn === "nonet" && (
+        <p className={styles.banner}>No internet on this phone. Shared links wait here and go up when you are back online.</p>
       )}
       {conn === "setup" && (
         <p className={styles.banner}>
-          No password is set on the laptop yet. In <code>backend/</code>, run <code>uv run python -m app.auth</code>.
+          This copy was built without its Supabase settings. Set <code>NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+          <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>, then build again.
         </p>
       )}
 
       {conn === "login" && (
         <form onSubmit={login} className={styles.panel}>
           <div>
-            <label className={styles.label} htmlFor="password">
-              Password
+            <label className={styles.label} htmlFor="email">
+              Sign in
             </label>
-            <p className={styles.muted}>Shared links stay on this phone until you log in.</p>
+            <p className={styles.muted}>Shared links stay on this phone until you sign in.</p>
           </div>
+          <input
+            id="email"
+            type="email"
+            autoComplete="username"
+            required
+            placeholder="Email"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+          />
           <div className={styles.row}>
             <input
               id="password"
               type="password"
               autoComplete="current-password"
               required
+              placeholder="Password"
+              aria-label="Password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
             />
@@ -267,47 +342,61 @@ export default function Home() {
         </form>
       )}
 
-      {queue.length > 0 && (
+      {queue.length + sentShares.length > 0 && (
         <section>
           <div className={styles.sectionHead}>
             <h2>Waiting for the laptop</h2>
-            <p>{queue.length} saved on this phone</p>
+            <p>{queue.length + sentShares.length} links</p>
           </div>
           <ul className={styles.list}>
             {queue.map((item) => (
               <li key={item.id}>
                 <span className={styles.dot} data-status="pending">
-                  Waiting
+                  On this phone
                 </span>
                 <span className={styles.meta}>{item.text}</span>
               </li>
             ))}
+            {sentShares.map((action) => (
+              <li key={action.id}>
+                <span className={styles.dot} data-status="processing">
+                  Sent
+                </span>
+                <span className={styles.meta}>{String(action.payload.text)}</span>
+              </li>
+            ))}
           </ul>
-          <div className={styles.row}>
-            <button type="button" className={styles.ghost} onClick={sync}>
-              Try again
-            </button>
-          </div>
+          {queue.length > 0 && (
+            <div className={styles.row}>
+              <button type="button" className={styles.ghost} onClick={sync}>
+                Try again
+              </button>
+            </div>
+          )}
         </section>
       )}
 
-      {rejected.length > 0 && (
+      {failedActions.length > 0 && (
         <section>
           <div className={styles.sectionHead}>
-            <h2>Not saved</h2>
-            <p>No Instagram link found</p>
+            <h2>Not done</h2>
+            <p>The laptop could not do these</p>
           </div>
           <ul className={styles.list}>
-            {rejected.map((text, index) => (
-              <li key={index} className={styles.meta}>
-                {text}
+            {failedActions.map((action) => (
+              <li key={action.id}>
+                <span className={styles.meta}>{action.kind === "share" ? String(action.payload.text) : action.kind}</span>
+                {action.error && <p className={styles.error}>{action.error}</p>}
+                <button type="button" className={styles.ghost} onClick={() => dismiss(action.id)}>
+                  Dismiss
+                </button>
               </li>
             ))}
           </ul>
         </section>
       )}
 
-      {conn === "up" && (
+      {signedIn && (
         <>
           <nav className={styles.tabs} aria-label="Sections">
             {tabs.map(([name, label, count]) => (
@@ -335,7 +424,7 @@ export default function Home() {
                   Share a reel from Instagram and it lands here.
                 </div>
               ) : (
-                inbox.map((entry) => <EntryCard key={entry.id} entry={entry} act={act} />)
+                inbox.map(card)
               )}
             </section>
           )}
@@ -352,7 +441,7 @@ export default function Home() {
                   Reels that fit this folder appear here.
                 </div>
               ) : (
-                inFolder(tab as Folder).map((entry) => <EntryCard key={entry.id} entry={entry} act={act} />)
+                inFolder(tab as Folder).map(card)
               )}
             </section>
           )}
@@ -399,7 +488,7 @@ export default function Home() {
                       </span>
                       {job.error && <p className={styles.error}>{job.error}</p>}
                       {job.status === "failed" && (
-                        <button type="button" className={styles.ghost} onClick={() => act(`/api/jobs/${job.id}/retry`, {})}>
+                        <button type="button" className={styles.ghost} onClick={() => act("retry", { job_id: job.id })}>
                           Run again
                         </button>
                       )}
@@ -410,7 +499,7 @@ export default function Home() {
             </section>
           )}
 
-          {tab === "settings" && status && (
+          {tab === "settings" && (
             <section>
               <div className={styles.sectionHead}>
                 <h2>Settings</h2>
@@ -435,43 +524,54 @@ export default function Home() {
                 </div>
               </form>
 
-              <ul className={styles.list}>
-                <li className={styles.check}>
-                  <span>Gemini key (sorting)</span>
-                  <span className={status.gemini_key ? styles.ok : styles.missing}>
-                    {status.gemini_key ? "Set" : "Missing"}
-                  </span>
-                </li>
-                <li className={styles.check}>
-                  <span>Groq key (speech)</span>
-                  <span className={status.groq_key ? styles.ok : styles.missing}>
-                    {status.groq_key ? "Set" : "Missing, speech skipped"}
-                  </span>
-                </li>
-                <li className={styles.check}>
-                  <span>Google Calendar and Tasks</span>
-                  <span className={status.google_connected ? styles.ok : styles.missing}>
-                    {status.google_connected ? "Connected" : status.google_configured ? "Not connected" : "Not set up"}
-                  </span>
-                </li>
-              </ul>
+              {status && (
+                <ul className={styles.list}>
+                  <li className={styles.check}>
+                    <span>Gemini key (sorting)</span>
+                    <span className={status.gemini_key ? styles.ok : styles.missing}>
+                      {status.gemini_key ? "Set" : "Missing"}
+                    </span>
+                  </li>
+                  <li className={styles.check}>
+                    <span>Groq key (speech)</span>
+                    <span className={status.groq_key ? styles.ok : styles.missing}>
+                      {status.groq_key ? "Set" : "Missing, speech skipped"}
+                    </span>
+                  </li>
+                  <li className={styles.check}>
+                    <span>Google Calendar and Tasks</span>
+                    <span className={status.google_connected ? styles.ok : styles.missing}>
+                      {status.google_connected ? "Connected" : status.google_configured ? "Not connected" : "Not set up"}
+                    </span>
+                  </li>
+                </ul>
+              )}
 
-              {status.google_configured && !status.google_connected && (
+              {status?.google_configured && !status.google_connected && (
                 <div className={styles.panel}>
-                  {/* A plain link, so the browser itself goes to Google and comes back to the laptop. */}
-                  <a className={styles.linkButton} href="/api/google/start">
-                    Connect Google
-                  </a>
-                  <p className={styles.muted}>Do this once, in a browser on the laptop itself (http://127.0.0.1:8000).</p>
+                  {status.google_auth_url ? (
+                    <a className={styles.linkButton} href={status.google_auth_url}>
+                      Continue to Google
+                    </a>
+                  ) : (
+                    <button type="button" className={styles.primary} onClick={() => act("google_start", {})}>
+                      Connect Google
+                    </button>
+                  )}
+                  <p className={styles.muted}>
+                    {status.google_auth_url
+                      ? "Sign in and allow Gleaner. You come back here afterwards."
+                      : "The laptop has to be on. A sign-in button appears here a few seconds later."}
+                  </p>
                 </div>
               )}
               <div className={styles.row}>
-                {status.google_connected && (
-                  <button type="button" className={styles.ghost} onClick={() => act("/api/google/disconnect", {})}>
+                {status?.google_connected && (
+                  <button type="button" className={styles.ghost} onClick={() => act("google_disconnect", {})}>
                     Disconnect Google
                   </button>
                 )}
-                <button type="button" className={styles.ghost} onClick={() => act("/api/logout", {})}>
+                <button type="button" className={styles.ghost} onClick={logout}>
                   Log out
                 </button>
               </div>

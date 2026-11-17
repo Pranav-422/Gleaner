@@ -6,12 +6,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx2
 import yt_dlp
 
 from . import db, llm
@@ -38,8 +40,8 @@ def instagram_url(text: str) -> str | None:
 # ---------- stages ----------
 
 
-def fetch(url: str, workdir: Path) -> tuple[list[Path], str, float]:
-    """Download a public reel or carousel without an account. Returns videos, caption, duration (s)."""
+def fetch(url: str, workdir: Path) -> tuple[list[Path], list[Path], str, float]:
+    """Download a public reel or carousel without an account. Returns videos, photos, caption, duration (s)."""
     if instagram_url(url) != url:
         raise ValueError("Not an Instagram link")
     options = {
@@ -52,14 +54,60 @@ def fetch(url: str, workdir: Path) -> tuple[list[Path], str, float]:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        "ignore_no_formats_error": True,  # photo posts and photo slides have no video; we take the photo instead
     }
     with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-    first = (info.get("entries") or [info])[0] or {}
+        # Look first, then download only the slides that have a video: downloading a photo slide is an error.
+        try:
+            info = ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError as exc:
+            # Instagram sometimes answers logged-out requests with nothing for a while; one slow retry.
+            if "empty media response" not in str(exc):
+                raise
+            time.sleep(30)
+            info = ydl.extract_info(url, download=False)
+        items = [item for item in (info.get("entries") or [info]) if item]
+        for item in items:
+            if item.get("formats"):
+                ydl.process_info(item)
+    first = items[0] if items else {}
     caption = info.get("description") or first.get("description") or ""
     duration = float(info.get("duration") or first.get("duration") or 0)
     videos = sorted(path for path in workdir.iterdir() if path.suffix.lower() in VIDEO_TYPES)
-    return videos, caption, duration
+    photos = [
+        path
+        for index, item in enumerate(items)
+        if not item.get("formats") and item.get("thumbnail")
+        and (path := photo(item["thumbnail"], workdir / f"photo_{index:02d}.jpg"))
+    ]  # fmt: skip
+    if not videos and not photos:
+        raise RuntimeError("Instagram gave no video or photo for this post")
+    return videos, photos, caption, duration
+
+
+# Photo URLs come from Instagram's own answer; anything pointing elsewhere is ignored.
+PHOTO_HOSTS = (".cdninstagram.com", ".fbcdn.net")
+MAX_PHOTO = 10 * 1024 * 1024
+
+
+def photo(url: str, out: Path) -> Path | None:
+    """Download one post photo from Instagram's CDN and store it as a JPEG the OCR can read."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not (parts.hostname or "").endswith(PHOTO_HOSTS):
+        return None
+    res = httpx2.get(url, timeout=30)
+    if res.status_code != 200 or not res.headers.get("content-type", "").startswith("image/") or len(res.content) > MAX_PHOTO:
+        return None
+    raw = out.with_suffix(".img")
+    raw.write_bytes(res.content)
+    # Re-encoded by FFmpeg: same size limit as video frames, and WebP becomes JPEG.
+    done = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", str(raw), "-vf", "scale=960:960:force_original_aspect_ratio=decrease",
+         "-q:v", "3", str(out)],
+        capture_output=True, timeout=60,
+    )  # fmt: skip
+    raw.unlink()
+    return out if done.returncode == 0 and out.exists() else None
 
 
 def frames(video: Path, outdir: Path, duration: float = 0) -> list[Path]:
@@ -175,9 +223,9 @@ class Extracted:
     frames: list[Path]  # the few worth keeping, most text first
 
 
-def read_videos(videos: list[Path], caption: str, duration: float, workdir: Path) -> Extracted:
+def read_videos(videos: list[Path], caption: str, duration: float, workdir: Path, photos: list[Path] = ()) -> Extracted:
     """Everything after the download: frames, OCR, speech, cleanup."""
-    images: list[Path] = []
+    images: list[Path] = list(photos)
     transcript: list[str] = []
     for video in videos:
         images += frames(video, workdir, duration)
@@ -191,28 +239,39 @@ def read_videos(videos: list[Path], caption: str, duration: float, workdir: Path
 
 
 def extract(url: str, workdir: Path) -> Extracted:
-    videos, caption, duration = fetch(url, workdir)
-    return read_videos(videos, caption, duration, workdir)
+    videos, photos, caption, duration = fetch(url, workdir)
+    return read_videos(videos, caption, duration, workdir, photos)
 
 
 def run_job(job_id: str, url: str, hint: str | None, entry_id: int | None) -> None:
     """Process one job end to end and store the result. The video never outlives this call."""
-    with tempfile.TemporaryDirectory(prefix="gleaner-") as tmp:
-        extracted = extract(url, Path(tmp))
-        frames_dir = db.DATA_DIR / "frames"
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        kept = []
-        for index, frame in enumerate(extracted.frames):
-            name = f"{job_id}_{index}.jpg"
-            shutil.copyfile(frame, frames_dir / name)
-            kept.append(name)
+    frames_dir = db.DATA_DIR / "frames"
+    # The extracted text is saved until the job is stored, so a retry after "Gemini busy" (or any later
+    # failure) repeats only the Gemini call, not the download, OCR and speech-to-text.
+    cache = db.DATA_DIR / "extracted" / f"{job_id}.json"
+    if cache.is_file():
+        saved = json.loads(cache.read_text(encoding="utf-8"))
+        text, kept = saved["text"], saved["frames"]
+    else:
+        with tempfile.TemporaryDirectory(prefix="gleaner-") as tmp:
+            extracted = extract(url, Path(tmp))
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            kept = []
+            for index, frame in enumerate(extracted.frames):
+                name = f"{job_id}_{index}.jpg"
+                shutil.copyfile(frame, frames_dir / name)
+                kept.append(name)
+        text = extracted.text
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"text": text, "frames": kept}), encoding="utf-8")
 
-        if not extracted.text and not hint:
-            result, tokens = None, {"in": 0, "out": 0}
-        else:
-            weak = len(extracted.text) < WEAK_TEXT_CHARS
-            result, tokens = llm.classify(extracted.text, hint, extracted.frames[:2] if weak else [])
-    store(job_id, url, entry_id, extracted.text, kept, result, tokens)
+    if not text and not hint:
+        result, tokens = None, {"in": 0, "out": 0}
+    else:
+        weak = len(text) < WEAK_TEXT_CHARS
+        result, tokens = llm.classify(text, hint, [frames_dir / name for name in kept[:2]] if weak else [])
+    store(job_id, url, entry_id, text, kept, result, tokens)
+    cache.unlink()
 
 
 def store(job_id, url, entry_id, raw_text, frames_kept, result: llm.Extraction | None, tokens) -> None:
