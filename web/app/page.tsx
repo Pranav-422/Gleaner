@@ -82,11 +82,8 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("inbox");
   const [notice, setNotice] = useState("");
   const [draft, setDraft] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [recording, setRecording] = useState(false);
   const [recovering, setRecovering] = useState(false);
-  const [newPassword, setNewPasswordValue] = useState("");
   const recorder = useRef<MediaRecorder | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const owner = useRef("");
@@ -304,35 +301,6 @@ export default function Home() {
     sync();
   }
 
-  async function login(event: React.FormEvent) {
-    event.preventDefault();
-    if (!cloud) return;
-    const { error } = await cloud.auth.signInWithPassword({ email: email.trim(), password });
-    setPassword("");
-    setNotice(error ? error.message : "");
-    sync();
-  }
-
-  // Forgot password: Supabase emails a link back to this app, which then asks for a new password.
-  async function forgot() {
-    if (!cloud) return;
-    if (!email.trim()) return setNotice("Type your email first, then tap Forgot password.");
-    await cloud.auth.resetPasswordForEmail(email.trim(), { redirectTo: `${location.origin}/` });
-    // Same message either way, so the page does not reveal which emails have an account.
-    setNotice("If that email has an account, a reset link is on its way.");
-  }
-
-  async function setNewPassword(event: React.FormEvent) {
-    event.preventDefault();
-    if (!cloud) return;
-    const { error } = await cloud.auth.updateUser({ password: newPassword });
-    setNewPasswordValue("");
-    if (error) return setNotice(error.message);
-    setRecovering(false);
-    setNotice("Password changed. Also update SUPABASE_PASSWORD in backend/.env on the laptop.");
-    sync();
-  }
-
   async function logout() {
     await cloud?.auth.signOut();
     digest.current = "";
@@ -418,17 +386,18 @@ export default function Home() {
     </div>
   );
 
-  if (conn === "login" && !recovering)
+  if (conn === "login" || recovering)
     return (
       <>
         <Landing
-          email={email}
-          setEmail={setEmail}
-          password={password}
-          setPassword={setPassword}
-          onLogin={login}
-          onForgot={forgot}
           queued={queue.length}
+          recovering={recovering}
+          onSignedIn={sync}
+          onPasswordSet={() => {
+            setRecovering(false);
+            setNotice("Password changed. If this is the laptop's account, also update SUPABASE_PASSWORD in backend/.env.");
+            sync();
+          }}
         />
         {toast}
       </>
@@ -465,28 +434,6 @@ export default function Home() {
         </p>
       )}
 
-      {recovering && (
-        <form onSubmit={setNewPassword} className={styles.panel}>
-          <label className={styles.label} htmlFor="new-password">
-            Choose a new password
-          </label>
-          <div className={styles.row}>
-            <input
-              id="new-password"
-              type="password"
-              autoComplete="new-password"
-              minLength={10}
-              required
-              value={newPassword}
-              onChange={(event) => setNewPasswordValue(event.target.value)}
-            />
-            <button type="submit" className={styles.primary}>
-              Save
-            </button>
-          </div>
-          <p className={styles.muted}>At least 10 characters.</p>
-        </form>
-      )}
 
       {queue.length + sentShares.length + sentFiles.length > 0 && (
         <section>

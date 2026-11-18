@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { AuthCard } from "./auth";
 import styles from "./landing.module.css";
 
 export function Mark({ size = 26 }: { size?: number }) {
@@ -31,7 +31,6 @@ const ICONS = {
   chat: "M21 12a8 8 0 0 1-11.6 7.1L3 21l1.9-6.4A8 8 0 1 1 21 12Z",
   shield: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Zm-3-10 2 2 4-4",
   plug: "M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0V8ZM12 18v4",
-  lock: "M6 11h12v10H6zM8 11V7a4 4 0 0 1 8 0v4",
 };
 
 const STEPS = [
@@ -50,21 +49,17 @@ const FEATURES = [
 ] as const;
 
 type Props = {
-  email: string;
-  setEmail: (value: string) => void;
-  password: string;
-  setPassword: (value: string) => void;
-  onLogin: (event: React.FormEvent) => void;
-  onForgot: () => void;
   queued: number;
+  recovering: boolean;
+  onSignedIn: () => void;
+  onPasswordSet: () => void;
 };
 
-export function Landing({ email, setEmail, password, setPassword, onLogin, onForgot, queued }: Props) {
-  const [show, setShow] = useState(false);
-  const emailRef = useRef<HTMLInputElement>(null);
+export function Landing({ queued, recovering, onSignedIn, onPasswordSet }: Props) {
   const focusSignIn = () => {
-    emailRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-    emailRef.current?.focus({ preventScroll: true });
+    const card = document.getElementById("signin");
+    card?.scrollIntoView({ behavior: "smooth", block: "center" });
+    card?.querySelector("input")?.focus({ preventScroll: true });
   };
 
   return (
@@ -91,72 +86,12 @@ export function Landing({ email, setEmail, password, setPassword, onLogin, onFor
           </p>
           <ul className={styles.trust}>
             <li>Runs on your own laptop</li>
-            <li>Owner-only, no public sign-up</li>
+            <li>Invite-only accounts</li>
             <li>Shares wait while the laptop sleeps</li>
           </ul>
         </div>
 
-        <form onSubmit={onLogin} className={styles.card} aria-labelledby="signin-title">
-          <div>
-            <h2 id="signin-title">Welcome back</h2>
-            <p className={styles.muted}>Sign in to open your Gleaner.</p>
-          </div>
-          {queued > 0 && (
-            <p className={styles.queued}>
-              {queued} shared {queued > 1 ? "items are" : "item is"} waiting on this phone. {queued > 1 ? "They go" : "It goes"} up as
-              soon as you sign in.
-            </p>
-          )}
-          <label className={styles.field}>
-            <span>Email</span>
-            <input
-              ref={emailRef}
-              type="email"
-              autoComplete="username"
-              required
-              placeholder="you@example.com"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-            />
-          </label>
-          <label className={styles.field}>
-            <span className={styles.fieldHead}>
-              Password
-              <button type="button" className={styles.link} onClick={onForgot}>
-                Forgot password?
-              </button>
-            </span>
-            <span className={styles.password}>
-              <input
-                type={show ? "text" : "password"}
-                autoComplete="current-password"
-                required
-                placeholder="Your password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-              />
-              <button
-                type="button"
-                className={styles.reveal}
-                aria-label={show ? "Hide password" : "Show password"}
-                aria-pressed={show}
-                onClick={() => setShow(!show)}
-              >
-                {show ? "Hide" : "Show"}
-              </button>
-            </span>
-          </label>
-          <button type="submit" className={styles.submit}>
-            Sign in
-          </button>
-          <p className={styles.footnote}>
-            <Icon d={ICONS.lock} />
-            <span>
-              Gleaner has one owner account, so there is no sign-up. Use the login you created in Supabase under
-              Authentication, Users.
-            </span>
-          </p>
-        </form>
+        <AuthCard queued={queued} recovering={recovering} onSignedIn={onSignedIn} onPasswordSet={onPasswordSet} />
       </header>
 
       <section className={styles.demo} aria-label="What a saved reel turns into">
