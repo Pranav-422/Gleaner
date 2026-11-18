@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { cloud } from "./cloud";
 import { type Act, type Entry, EntryCard, FOLDERS, type Folder } from "./entries";
+import { Landing, Mark } from "./landing";
 import styles from "./page.module.css";
 
 type Queued = { id: string; text: string };
@@ -68,18 +69,6 @@ const ago = (iso: string) => {
   if (minutes < 1440) return `${Math.round(minutes / 60)} h ago`;
   return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short" });
 };
-
-function Mark() {
-  // A wheat ear: the gleaner picks up what was left behind.
-  return (
-    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true">
-      <path d="M12 22V8" />
-      <path d="M12 8c0-2.5 1.2-4.5 3-6-.2 2.6-1.2 4.6-3 6Zm0 0c0-2.5-1.2-4.5-3-6 .2 2.6 1.2 4.6 3 6Z" />
-      <path d="M12 13c1.8-1.6 4-2.2 6-2-1.4 1.8-3.6 2.4-6 2Zm0 0c-1.8-1.6-4-2.2-6-2 1.4 1.8 3.6 2.4 6 2Z" />
-      <path d="M12 18c1.8-1.6 4-2.2 6-2-1.4 1.8-3.6 2.4-6 2Zm0 0c-1.8-1.6-4-2.2-6-2 1.4 1.8 3.6 2.4 6 2Z" />
-    </svg>
-  );
-}
 
 export default function Home() {
   const [queue, setQueue] = useState<Queued[]>([]);
@@ -420,6 +409,31 @@ export default function Home() {
     setup: "Needs setup",
   }[conn];
 
+  const toast = notice && (
+    <div role="alert" className={styles.notice}>
+      <span>{notice}</span>
+      <button type="button" aria-label="Dismiss" onClick={() => setNotice("")}>
+        ✕
+      </button>
+    </div>
+  );
+
+  if (conn === "login" && !recovering)
+    return (
+      <>
+        <Landing
+          email={email}
+          setEmail={setEmail}
+          password={password}
+          setPassword={setPassword}
+          onLogin={login}
+          onForgot={forgot}
+          queued={queue.length}
+        />
+        {toast}
+      </>
+    );
+
   return (
     <main className={styles.main}>
       <header className={styles.header}>
@@ -432,14 +446,7 @@ export default function Home() {
         </span>
       </header>
 
-      {notice && (
-        <div role="alert" className={styles.notice}>
-          <span>{notice}</span>
-          <button type="button" aria-label="Dismiss" onClick={() => setNotice("")}>
-            ✕
-          </button>
-        </div>
-      )}
+      {toast}
 
       {conn === "down" && (
         <p className={styles.banner}>
@@ -478,47 +485,6 @@ export default function Home() {
             </button>
           </div>
           <p className={styles.muted}>At least 10 characters.</p>
-        </form>
-      )}
-
-      {conn === "login" && !recovering && (
-        <form onSubmit={login} className={styles.panel}>
-          <div>
-            <label className={styles.label} htmlFor="email">
-              Sign in
-            </label>
-            <p className={styles.muted}>
-              Gleaner has one owner account, so there is no sign-up. Use the email and password you added in
-              Supabase (Authentication, Users). Shared links stay on this phone until you sign in.
-            </p>
-          </div>
-          <input
-            id="email"
-            type="email"
-            autoComplete="username"
-            required
-            placeholder="Email"
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-          />
-          <div className={styles.row}>
-            <input
-              id="password"
-              type="password"
-              autoComplete="current-password"
-              required
-              placeholder="Password"
-              aria-label="Password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-            />
-            <button type="submit" className={styles.primary}>
-              Unlock
-            </button>
-          </div>
-          <button type="button" className={`${styles.ghost} ${styles.small}`} onClick={forgot}>
-            Forgot password?
-          </button>
         </form>
       )}
 

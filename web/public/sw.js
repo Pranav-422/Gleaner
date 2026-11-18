@@ -41,9 +41,17 @@ self.addEventListener("fetch", (event) => {
   const isPage = event.request.mode === "navigate";
   event.respondWith(
     (async () => {
-      // Every page load, including a share (/?text=...), gets the one cached shell.
-      const cached = await caches.match(isPage ? "/" : event.request);
-      if (isPage) event.waitUntil(precache().catch(() => {}));
+      // Pages go network-first, so a new deploy shows on the first load; the cached shell
+      // (one for every URL, including a share /?text=...) is the offline fallback.
+      if (isPage) {
+        event.waitUntil(precache().catch(() => {}));
+        try {
+          return await fetch(event.request);
+        } catch {
+          return (await caches.match("/")) || Response.error();
+        }
+      }
+      const cached = await caches.match(event.request);
       if (cached) return cached;
       const res = await fetch(event.request);
       if (res.ok && url.pathname.startsWith("/_next/static/")) {
