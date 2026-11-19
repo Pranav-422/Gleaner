@@ -84,6 +84,7 @@ export default function Home() {
   const [draft, setDraft] = useState("");
   const [recording, setRecording] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  const [problem, setProblem] = useState("");
   const recorder = useRef<MediaRecorder | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const owner = useRef("");
@@ -95,6 +96,12 @@ export default function Home() {
   const entriesNow = useRef<Entry[]>([]);
   const connNow = useRef<Conn>("checking"); // for code that runs outside a render, like the Google return
 
+  // A failed fetch is a lost connection; anything else is Supabase refusing, shown word for word.
+  const refused = (error: { message: string }): Conn => {
+    setProblem(/fetch|network/i.test(error.message) ? "" : error.message);
+    return "nonet";
+  };
+
   async function load(): Promise<Conn> {
     if (!cloud) return "setup";
     const { data } = await cloud.auth.getSession();
@@ -105,7 +112,7 @@ export default function Home() {
       const { error } = await cloud
         .from("actions")
         .upsert({ id: item.id, kind: "share", payload: { text: item.text } }, { onConflict: "id", ignoreDuplicates: true });
-      if (error) return "nonet"; // kept on the phone; tried again next time
+      if (error) return refused(error); // kept on the phone; tried again next time
       writeQueue(readQueue().filter((queued) => queued.id !== item.id));
     }
 
@@ -114,7 +121,7 @@ export default function Home() {
       cloud.from("state").select("digest, seen_at").maybeSingle(),
       cloud.from("actions").select("id, kind, payload, status, error").order("created_at"),
     ]);
-    if (headRes.error || actionsRes.error) return "nonet";
+    if (headRes.error || actionsRes.error) return refused((headRes.error ?? actionsRes.error)!);
     const head = headRes.data;
     setSeenAt(head?.seen_at ?? null);
     setActions(actionsRes.data ?? []);
@@ -122,7 +129,7 @@ export default function Home() {
     let list = entriesNow.current;
     if (head && head.digest !== digest.current) {
       const full = await cloud.from("state").select("jobs, entries, status").maybeSingle();
-      if (full.error || !full.data) return "nonet";
+      if (full.error || !full.data) return refused(full.error ?? { message: "The laptop's state row is missing." });
       list = full.data.entries;
       setJobs(full.data.jobs);
       setEntries(list);
@@ -140,6 +147,7 @@ export default function Home() {
       }
       setFrames({ ...signed.current });
     }
+    setProblem("");
     return head && Date.now() - new Date(head.seen_at).getTime() < OFFLINE_AFTER ? "up" : "down";
   }
 
@@ -149,7 +157,7 @@ export default function Home() {
     lastSync.current = Date.now();
     try {
       setQueue(readQueue());
-      connNow.current = await load().catch((): Conn => "nonet");
+      connNow.current = await load().catch((err: Error) => refused(err));
       setConn(connNow.current);
       setQueue(readQueue());
     } finally {
@@ -372,7 +380,7 @@ export default function Home() {
     checking: "Connecting",
     up: working ? `Reading ${working} reel${working > 1 ? "s" : ""}` : "Laptop online",
     down: seenAt ? `Laptop offline · ${ago(seenAt)}` : "Laptop not set up",
-    nonet: "No internet",
+    nonet: problem ? "Sync error" : "No internet",
     login: "Locked",
     setup: "Needs setup",
   }[conn];
@@ -425,7 +433,16 @@ export default function Home() {
         </p>
       )}
       {conn === "nonet" && (
-        <p className={styles.banner}>No internet on this phone. Shared links wait here and go up when you are back online.</p>
+        <p className={styles.banner}>
+          {problem ? (
+            <>
+              Supabase refused the request: <code>{problem}</code>. A missing column or table means{" "}
+              <code>supabase/schema.sql</code> has not been run yet. Shared links wait on this phone meanwhile.
+            </>
+          ) : (
+            "No internet on this phone. Shared links wait here and go up when you are back online."
+          )}
+        </p>
       )}
       {conn === "setup" && (
         <p className={styles.banner}>
@@ -698,6 +715,12 @@ export default function Home() {
                 <h2>Settings</h2>
               </div>
 
+              {status?.gemini_key === undefined && (
+                <p className={styles.banner}>
+                  The laptop has not checked in yet, so its keys and Google Calendar show up here once it does. Start Gleaner on
+                  the laptop with the Supabase settings in <code>backend/.env</code>.
+                </p>
+              )}
               {status && (
                 <ul className={styles.list}>
                   <li className={styles.check}>
